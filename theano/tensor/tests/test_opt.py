@@ -6710,6 +6710,7 @@ def test_local_log_sum_exp2():
     f = compile_graph_log_sum_exp(x, axis=(1,), dimshuffle_op=transpose_op)
     naive_ret = numpy.log(numpy.sum(numpy.exp(x_val), axis=1).T)
     optimised_ret = f(x_val)
+
     assert numpy.allclose(naive_ret, optimised_ret)
 
 
