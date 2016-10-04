@@ -224,28 +224,28 @@ def local_LogSumExp_optim(node):
 ####  # 	     result = A_max + T.log(A_reduced)
 ####  
 ####  
-####  def old_log_add_exp_elemwise(A,B):
-####      if A is None:
-####          return B
-####      elif B is None:
-####          return A
-####  
-####      ## own version using abs
-####      # D = T.abs_(A-B)
-####      # return (A+B+D)*0.5 + T.log1p(T.exp(-D))
-####  
-####      ## own version using max
-####      # max_A_B = T.switch( A>B, A, B)
-####      # return max_A_B + T.log(T.exp(A-max_A_B)+T.exp(B-max_A_B))
-####  
-####      ## softplus version
-####      # return A+softplus(B-A)
-####  
-####      ## logsumexp_reducelast version
-####      # return logsumexp_reducelast(T.stack((A,B),axis=-1))
-####  
-####      ## logsumexp_version
-####      return logsumexp(T.stack((A,B),axis=-1))
+def logaddexp(A,B):
+    if A is None:
+        return B
+    elif B is None:
+        return A
+
+    ## own version using abs
+    # D = T.abs_(A-B)
+    # return (A+B+D)*0.5 + T.log1p(T.exp(-D))
+
+    ## own version using max
+    # max_A_B = T.switch( A>B, A, B)
+    # return max_A_B + T.log(T.exp(A-max_A_B)+T.exp(B-max_A_B))
+
+    ## softplus version
+    return A+softplus(B-A)
+
+    ## logsumexp_reducelast version
+    # return logsumexp_reducelast(T.stack((A,B),axis=-1))
+
+    ## logsumexp_version
+    # return logsumexp(T.stack((A,B),axis=-1))
 ####      
 ####  ######## WHAT FOLLOWS ARE UNUSED (CURRENTLY UNREGISTERED) OPTIMIZATIONS ##########
 ####          
