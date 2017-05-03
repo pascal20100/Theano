@@ -548,7 +548,7 @@ class CLinker(link.Linker):
         if schedule:
             self.schedule = schedule
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
         Associate linker with fgraph
 
@@ -557,7 +557,8 @@ class CLinker(link.Linker):
             no_recycling = []
         if self.fgraph is not None and self.fgraph is not fgraph:
             # A linker can be tied to only one FunctionGraph.
-            return type(self)(self.schedule).accept(fgraph, no_recycling)
+            return type(self)(self.schedule).accept(
+                fgraph, no_recycling, profile)
         self.fgraph = fgraph
         self.fetch_variables()
         self.no_recycling = no_recycling
@@ -717,7 +718,7 @@ class CLinker(link.Linker):
                               [get_c_declare, get_c_extract_out,
                                   (get_c_sync, get_c_cleanup)]]
             else:
-                raise Exception("what the fuck")
+                raise Exception("this shouldn't be possible, please report this exception")
 
             builder, block = struct_variable_codeblocks(variable, policy,
                                                         id, symbol, sub)
@@ -1581,6 +1582,9 @@ class CLinker(link.Linker):
             # If we can't get a key, then forget the cache mechanism.
             module = self.compile_cmodule()
         else:
+            # Set compute_map as None as clinker do not support lazy evaluation
+            for node in self.node_order:
+                node.op.prepare_node(node, storage_map, None, 'c')
             module = get_module_cache().module_from_key(
                 key=key, lnk=self, keep_lock=keep_lock)
 
@@ -1737,7 +1741,7 @@ class OpWiseCLinker(link.LocalLinker):
         if schedule:
             self.schedule = schedule
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
         Associate linker with fgraph
         """
@@ -1750,7 +1754,7 @@ class OpWiseCLinker(link.LocalLinker):
                 allow_gc=self.allow_gc,
                 nice_errors=self.nice_errors,
                 schedule=self.schedule,
-            ).accept(fgraph, no_recycling)
+            ).accept(fgraph, no_recycling, profile)
         self.fgraph = fgraph
         self.no_recycling = no_recycling
         return self
@@ -1783,24 +1787,14 @@ class OpWiseCLinker(link.LocalLinker):
 
             thunks = []
             for node in order:
-                # Maker sure we use the C version of the code whenever
-                # possible
-                # There are ops that don't have _op_use_c_code property
-                # for example ifelse (or any ops that come with their own
-                # make_thunk
-                old_value = getattr(node.op, '_op_use_c_code', False)
-                try:
-                    if theano.config.cxx:
-                        node.op._op_use_c_code = True
-                    thunks += [node.op.make_thunk(node,
-                                                  storage_map,
-                                                  compute_map,
-                                                  no_recycling)]
-                    thunks[-1].inputs = [storage_map[v] for v in node.inputs]
-                    thunks[-1].outputs = [storage_map[v] for v in node.outputs]
-
-                finally:
-                    node.op._op_use_c_code = old_value
+                # make_thunk will try by default C code, otherwise
+                # it fall back to python.
+                thunks += [node.op.make_thunk(node,
+                                              storage_map,
+                                              compute_map,
+                                              no_recycling)]
+                thunks[-1].inputs = [storage_map[v] for v in node.inputs]
+                thunks[-1].outputs = [storage_map[v] for v in node.outputs]
 
             for node in order:
                 if self.allow_gc:
@@ -1897,7 +1891,7 @@ class DualLinker(link.Linker):
         if schedule:
             self.schedule = schedule
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
         Update/tie self with fgraph
         """
@@ -1905,7 +1899,7 @@ class DualLinker(link.Linker):
             no_recycling = []
         if self.fgraph is not None and self.fgraph is not fgraph:
             return type(self)(self.checker, self.schedule).accept(
-                fgraph, no_recycling)
+                fgraph, no_recycling, profile)
         self.fgraph = fgraph
         self.no_recycling = no_recycling
         return self

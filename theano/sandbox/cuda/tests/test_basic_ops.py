@@ -1009,22 +1009,20 @@ class T_subtensor(theano.tensor.tests.test_subtensor.T_subtensor):
     def shortDescription(self):
         return None
 
-    shared = staticmethod(cuda.shared_constructor)
-    sub = cuda.GpuSubtensor
-    inc_sub = cuda.GpuIncSubtensor
-    adv_sub1 = cuda.GpuAdvancedSubtensor1
-    adv_incsub1 = cuda.GpuAdvancedIncSubtensor1
-    mode = mode_with_gpu
-    dtype = 'float32'
-    type = tcn.CudaNdarrayType
-    ignore_topo = (B.HostFromGpu, B.GpuFromHost, theano.compile.DeepCopyOp)
-    fast_compile = False
-    ops = (cuda.GpuSubtensor, cuda.GpuIncSubtensor,
-           cuda.GpuAdvancedSubtensor1, cuda.GpuAdvancedIncSubtensor1)
-
     def __init__(self, name):
-        return super(theano.tensor.tests.test_subtensor.T_subtensor,
-                     self).__init__(name)
+        super(T_subtensor, self).__init__(
+            name,
+            shared=cuda.shared_constructor,
+            sub=cuda.GpuSubtensor,
+            inc_sub=cuda.GpuIncSubtensor,
+            adv_sub1=cuda.GpuAdvancedSubtensor1,
+            adv_incsub1=cuda.GpuAdvancedIncSubtensor1,
+            dimshuffle=cuda.GpuDimShuffle,
+            mode=mode_with_gpu,
+            dtype='float32',
+            type=tcn.CudaNdarrayType,
+            ignore_topo=(B.HostFromGpu, B.GpuFromHost, theano.compile.DeepCopyOp))
+        self.fast_compile = False
 
     def test_adv_sub1_fast(self):
         """We check that the special cases of advanced indexing that
@@ -1075,7 +1073,7 @@ class T_subtensor(theano.tensor.tests.test_subtensor.T_subtensor):
             # Test with c_contiguous input
             t = self.adv_sub1()(n, idx)
             t.owner.op.perform_using_take = True  # input c_contiguous, so we reshape
-            val = self.eval_output_and_check(t, list=True)
+            val = self.eval_output_and_check(t, op_type=self.adv_sub1)
 
             val = numpy.asarray(val)
             good = data[idx]
@@ -1369,12 +1367,12 @@ def speed_adv_sub1():
     vec = tensor.lvector()
     for batch_size in [100, 1000, 10000, 100000]:
         idx = numpy.random.randint(0, 50000, batch_size)
-        mode_with_gpu = theano.compile.ProfileMode().including('gpu')
-        f = theano.function([vec], var[vec], mode=mode_with_gpu)
+        mode_with_gpu = theano.compile.get_default_mode().including('gpu')
+        f = theano.function([vec], var[vec], mode=mode_with_gpu, profile=True)
         for i in range(100):
             f(idx)
-        print("ProfileMode with batch size", batch_size)
-        mode_with_gpu.print_summary()
+        print("profile with batch size", batch_size)
+        mode_with_gpu.summary()
 
 
 def speed_reduce10():

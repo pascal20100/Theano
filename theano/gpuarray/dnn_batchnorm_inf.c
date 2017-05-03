@@ -2,11 +2,16 @@
 
 int dnn_batchnorm_op(PyGpuArrayObject *inp, PyGpuArrayObject *scale,
                      PyGpuArrayObject *bias, PyGpuArrayObject *est_mean,
-                     PyGpuArrayObject *est_var, PyGpuArrayObject **outp,
-                     PyGpuContextObject *c) {
+                     PyGpuArrayObject *est_var, npy_float64 epsilon, 
+                     PyGpuArrayObject **outp, cudnnHandle_t _handle) {
+  PyGpuContextObject *c = inp->context;
+
   if (c_set_tensorNd(inp, bn_input) != 0)
     return 1;
   if (c_set_tensorNd(scale, bn_params) != 0)
+    return 1;
+
+  if (epsilon < 1e-5)
     return 1;
 
   if (theano_prep_output(outp, inp->ga.nd, inp->ga.dimensions, inp->ga.typecode, GA_C_ORDER, c) != 0)
@@ -30,7 +35,7 @@ int dnn_batchnorm_op(PyGpuArrayObject *inp, PyGpuArrayObject *scale,
       beta = (void *)&fbeta;
     }
     cudnnStatus_t err = cudnnBatchNormalizationForwardInference(
-      APPLY_SPECIFIC(_handle),
+      _handle,
       MODE,
       alpha,
       beta,
@@ -43,7 +48,7 @@ int dnn_batchnorm_op(PyGpuArrayObject *inp, PyGpuArrayObject *scale,
       PyGpuArray_DEV_DATA(bias),
       PyGpuArray_DEV_DATA(est_mean),
       PyGpuArray_DEV_DATA(est_var),
-      EPSILON
+      epsilon
       );
     if (err != CUDNN_STATUS_SUCCESS) {
       PyErr_Format(PyExc_RuntimeError, "Error during batchnorm: %s\n",

@@ -405,9 +405,9 @@ AddConfigVar(
 AddConfigVar(
     'mode',
     "Default compilation mode",
-    EnumStr('Mode', 'ProfileMode', 'DebugMode', 'FAST_RUN',
+    EnumStr('Mode', 'DebugMode', 'FAST_RUN',
             'NanGuardMode',
-            'FAST_COMPILE', 'PROFILE_MODE', 'DEBUG_MODE'),
+            'FAST_COMPILE', 'DEBUG_MODE'),
     in_c_key=False)
 
 param = "g++"
@@ -439,20 +439,31 @@ if param != "":
     del newp
     del distutils
 
+# to support path that includes spaces, we need to wrap it with double quotes on Windows
+if param and os.name == 'nt':
+    param = '"%s"' % param
+
+
+def warn_cxx(val):
+    """We only support clang++ as otherwise we hit strange g++/OSX bugs."""
+    if sys.platform == 'darwin' and 'clang++' not in val:
+        _logger.warning("Only clang++ is supported. With g++,"
+                        " we end up with strange g++/OSX bugs.")
+    return True
+
 AddConfigVar('cxx',
              "The C++ compiler to use. Currently only g++ is"
              " supported, but supporting additional compilers should not be "
              "too difficult. "
              "If it is empty, no C++ code is compiled.",
-             StrParam(param),
+             StrParam(param, is_valid=warn_cxx),
              in_c_key=False)
 del param
 
 if rc == 0 and config.cxx != "":
     # Keep the default linker the same as the one for the mode FAST_RUN
     AddConfigVar('linker',
-                 ("Default linker used if the theano flags mode is Mode "
-                  "or ProfileMode(deprecated)"),
+                 "Default linker used if the theano flags mode is Mode",
                  EnumStr('cvm', 'c|py', 'py', 'c', 'c|py_nogc',
                          'vm', 'vm_nogc', 'cvm_nogc'),
                  in_c_key=False)
@@ -460,8 +471,7 @@ else:
     # g++ is not present or the user disabled it,
     # linker should default to python only.
     AddConfigVar('linker',
-                 ("Default linker used if the theano flags mode is Mode "
-                  "or ProfileMode(deprecated)"),
+                 "Default linker used if the theano flags mode is Mode",
                  EnumStr('vm', 'py', 'vm_nogc'),
                  in_c_key=False)
     try:
@@ -489,8 +499,7 @@ AddConfigVar('allow_gc',
 # Keep the default optimizer the same as the one for the mode FAST_RUN
 AddConfigVar(
     'optimizer',
-    ("Default optimizer. If not None, will use this linker with the Mode "
-     "object (not ProfileMode(deprecated) or DebugMode)"),
+    "Default optimizer. If not None, will use this optimizer with the Mode",
     EnumStr('fast_run', 'merge', 'fast_compile', 'None'),
     in_c_key=False)
 
@@ -602,10 +611,6 @@ AddConfigVar(
     " If greater then 0, will also make us save Theano internal stack trace.",
     IntParam(0),
     in_c_key=False)
-
-AddConfigVar('experimental.mrg',
-             "Another random number generator that work on the gpu",
-             BoolParam(False))
 
 AddConfigVar('experimental.unpickle_gpu_on_cpu',
              "Allow unpickling of pickled CudaNdarrays as numpy.ndarrays."
@@ -943,27 +948,6 @@ AddConfigVar('NanGuardMode.action',
              EnumStr('raise', 'warn', 'pdb'),
              in_c_key=False)
 
-AddConfigVar('ProfileMode.n_apply_to_print',
-             "Number of apply instances to print by default",
-             IntParam(15, lambda i: i > 0),
-             in_c_key=False)
-
-AddConfigVar('ProfileMode.n_ops_to_print',
-             "Number of ops to print by default",
-             IntParam(20, lambda i: i > 0),
-             in_c_key=False)
-
-AddConfigVar('ProfileMode.min_memory_size',
-             "For the memory profile, do not print apply nodes if the size "
-             "of their outputs (in bytes) is lower then this threshold",
-             IntParam(1024, lambda i: i >= 0),
-             in_c_key=False)
-
-AddConfigVar('ProfileMode.profile_memory',
-             """Enable profiling of memory used by Theano functions""",
-             BoolParam(False),
-             in_c_key=False)
-
 AddConfigVar('optimizer_excluding',
              ("When using the default mode, we will remove optimizer with "
               "these tags. Separate tags with ':'."),
@@ -1177,7 +1161,7 @@ def default_blas_ldflags():
             use_unix_epd = True
             if sys.platform == 'win32':
                 return ' '.join(
-                    ['-L%s' % os.path.join(sys.prefix, "Scripts")] +
+                    ['-L"%s"' % os.path.join(sys.prefix, "Scripts")] +
                     # Why on Windows, the library used are not the
                     # same as what is in
                     # blas_info['libraries']?
@@ -1247,14 +1231,14 @@ def default_blas_ldflags():
                     ['-l%s' % l for l in blas_info['libraries']])
             elif sys.platform == 'win32':
                 return ' '.join(
-                    ['-L%s' % lib_path] +
+                    ['-L"%s"' % lib_path] +
                     # Why on Windows, the library used are not the
                     # same as what is in blas_info['libraries']?
                     ['-l%s' % l for l in ["mk2_core", "mk2_intel_thread",
                                           "mk2_rt"]])
 
         # Anaconda
-        if "Anaconda" in sys.version and sys.platform == "win32":
+        if "Anaconda" in sys.version or "Continuum" in sys.version:
             # If the "mkl-service" conda package (available
             # through Python package "mkl") is installed and
             # importable, then the libraries (installed by conda
@@ -1267,22 +1251,33 @@ def default_blas_ldflags():
                 _logger.info('Conda mkl is not available: %s', e)
             else:
                 # This branch is executed if no exception was raised
-                lib_path = os.path.join(sys.prefix, 'DLLs')
-                flags = ['-L%s' % lib_path]
+                if sys.platform == "win32":
+                    lib_path = os.path.join(sys.prefix, 'DLLs')
+                    flags = ['-L"%s"' % lib_path]
+                else:
+                    lib_path = blas_info.get('library_dirs', [])[0]
+                    flags = ['-L%s' % lib_path]
                 flags += ['-l%s' % l for l in ["mkl_core",
                                                "mkl_intel_thread",
                                                "mkl_rt"]]
                 res = try_blas_flag(flags)
                 if res:
                     return res
+                flags.extend(['-Wl,-rpath,' + l for l in
+                              blas_info.get('library_dirs', [])])
+                res = try_blas_flag(flags)
+                if res:
+                    return res
 
+        # to support path that includes spaces, we need to wrap it with double quotes on Windows
+        path_wrapper = "\"" if os.name == 'nt' else ""
         ret = (
             # TODO: the Gemm op below should separate the
             # -L and -l arguments into the two callbacks
             # that CLinker uses for that stuff.  for now,
             # we just pass the whole ldflags as the -l
             # options part.
-            ['-L%s' % l for l in blas_info.get('library_dirs', [])] +
+            ['-L%s%s%s' % (path_wrapper, l, path_wrapper) for l in blas_info.get('library_dirs', [])] +
             ['-l%s' % l for l in blas_info.get('libraries', [])] +
             blas_info.get('extra_link_args', []))
         # For some very strange reason, we need to specify -lm twice
@@ -1343,7 +1338,11 @@ def try_blas_flag(flags):
             return 0;
         }
         """)
-    cflags = flags + ['-L' + d for d in theano.gof.cmodule.std_lib_dirs()]
+    cflags = list(flags)
+    # to support path that includes spaces, we need to wrap it with double quotes on Windows
+    path_wrapper = "\"" if os.name == 'nt' else ""
+    cflags.extend(['-L%s%s%s' % (path_wrapper, d, path_wrapper) for d in theano.gof.cmodule.std_lib_dirs()])
+
     res = GCC_compiler.try_compile_tmp(
         test_code, tmp_prefix='try_blas_',
         flags=cflags, try_run=True)
@@ -1630,6 +1629,8 @@ def short_platform(r=None, p=None):
 
     return p
 compiledir_format_dict['short_platform'] = short_platform()
+# Allow to have easily one compiledir per device.
+compiledir_format_dict['device'] = config.device
 compiledir_format_keys = ", ".join(sorted(compiledir_format_dict.keys()))
 default_compiledir_format = ("compiledir_%(short_platform)s-%(processor)s-"
                              "%(python_version)s-%(python_bitwidth)s")

@@ -12,7 +12,7 @@ import unittest
 import numpy
 from six.moves import xrange
 from nose.plugins.skip import SkipTest
-from nose.tools import assert_raises
+from nose.tools import assert_raises, assert_true
 from numpy.testing import dec
 from numpy.testing.noseclasses import KnownFailureTest
 
@@ -32,21 +32,25 @@ import theano.tensor.opt as opt
 from theano.tensor.opt import (
         local_add_specialize,
         local_dimshuffle_lift,
+        local_useless_dimshuffle_in_reshape,
         local_useless_alloc,
+        local_merge_alloc,
         local_greedy_distributor,
+        local_useless_reshape,
+        local_reshape_to_dimshuffle,
         mul_canonizer,
-        out2in,
         Shape_i,
         Assert,
         MakeVector,
         make_vector,
-        local_expm1
+        local_expm1,
+        local_canonicalize_alloc
         )
 from theano import tensor
 from theano import tensor as T
 from theano.tensor import scalar, iscalar, lscalar, fscalar, dscalar
 from theano.tensor import vector, ivector, lvector, fvector, dvector
-from theano.tensor import matrix, imatrix, lmatrix, fmatrix, dmatrix
+from theano.tensor import matrix, imatrix, lmatrix, fmatrix, dmatrix, tensor3
 from theano.tensor import scalars, vectors, matrices, fmatrices, dmatrices
 from theano.tensor import (
         AdvancedSubtensor,
@@ -60,14 +64,13 @@ from theano.tensor import (
         join,
         Subtensor,
         TensorType,
-        Tile,
         tile
         )
 from theano.tensor.elemwise import DimShuffle
 from theano.tests import unittest_tools as utt
 from theano.compile.mode import optdb
 from theano.compile import Mode
-from theano.gof.opt import check_stack_trace
+from theano.gof.opt import check_stack_trace, out2in
 from nose.plugins.attrib import attr
 
 mode_opt = theano.config.mode
@@ -114,7 +117,7 @@ class test_dimshuffle_lift(unittest.TestCase):
         x, y, z = inputs()
         e = ds(ds(x, (1, 0)), (1, 0))
         g = FunctionGraph([x], [e])
-        self.assertTrue(str(g) == "[DimShuffle{1,0}(DimShuffle{1,0}(x))]")
+        self.assertTrue(str(g) == "[InplaceDimShuffle{1,0}(InplaceDimShuffle{1,0}(x))]")
         dimshuffle_lift.optimize(g)
         self.assertTrue(str(g) == "[x]")
         # no need to check_stack_trace as graph is supposed to be empty
@@ -123,11 +126,10 @@ class test_dimshuffle_lift(unittest.TestCase):
         x, y, z = inputs()
         e = ds(ds(x, (1, 'x', 0)), (2, 0, 'x', 1))
         g = FunctionGraph([x], [e])
-        self.assertTrue(
-            str(g) == "[DimShuffle{2,0,x,1}(DimShuffle{1,x,0}(x))]",
-            str(g))
+        self.assertTrue(str(g) == "[InplaceDimShuffle{2,0,x,1}(InplaceDimShuffle{1,x,0}(x))]",
+                        str(g))
         dimshuffle_lift.optimize(g)
-        self.assertTrue(str(g) == "[DimShuffle{0,1,x,x}(x)]", str(g))
+        self.assertTrue(str(g) == "[InplaceDimShuffle{0,1,x,x}(x)]", str(g))
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(check_stack_trace(g, ops_to_check='all'))
 
@@ -135,10 +137,9 @@ class test_dimshuffle_lift(unittest.TestCase):
         x, y, z = inputs()
         e = ds(ds(ds(x, (0, 'x', 1)), (2, 0, 'x', 1)), (1, 0))
         g = FunctionGraph([x], [e])
-        self.assertTrue(
-            str(g) == "[DimShuffle{1,0}(DimShuffle{2,0,x,1}"
-                      "(DimShuffle{0,x,1}(x)))]",
-            str(g))
+        self.assertTrue(str(g) == "[InplaceDimShuffle{1,0}(InplaceDimShuffle{2,0,x,1}"
+                          "(InplaceDimShuffle{0,x,1}(x)))]",
+                        str(g))
         dimshuffle_lift.optimize(g)
         self.assertTrue(str(g) == "[x]", str(g))
         # no need to check_stack_trace as graph is supposed to be empty
@@ -176,24 +177,22 @@ class test_dimshuffle_lift(unittest.TestCase):
         m = T.matrix(dtype="float64")
         out = ((v + 42) * (m + 84)).T
         g = FunctionGraph([v, m], [out])
-        init_str_g = ("[DimShuffle{1,0}(Elemwise{mul,no_inplace}"
-                      "(DimShuffle{x,0}(Elemwise{add,no_inplace}"
+        init_str_g = ("[InplaceDimShuffle{1,0}(Elemwise{mul,no_inplace}"
+                      "(InplaceDimShuffle{x,0}(Elemwise{add,no_inplace}"
                       "(<TensorType(float64, vector)>, "
-                      "DimShuffle{x}(TensorConstant{42}))), "
+                      "InplaceDimShuffle{x}(TensorConstant{42}))), "
                       "Elemwise{add,no_inplace}"
                       "(<TensorType(float64, matrix)>, "
-                      "DimShuffle{x,x}(TensorConstant{84}))))]")
-
+                      "InplaceDimShuffle{x,x}(TensorConstant{84}))))]")
         self.assertTrue(str(g) == init_str_g)
         new_out = local_dimshuffle_lift.transform(g.outputs[0].owner)[0]
         new_g = FunctionGraph(g.inputs, [new_out])
         opt_str_g = ("[Elemwise{mul,no_inplace}(Elemwise{add,no_inplace}"
-                     "(DimShuffle{0,x}(<TensorType(float64, vector)>), "
-                     "DimShuffle{x,x}(TensorConstant{42})), "
-                     "Elemwise{add,no_inplace}(DimShuffle{1,0}"
+                     "(InplaceDimShuffle{0,x}(<TensorType(float64, vector)>), "
+                     "InplaceDimShuffle{x,x}(TensorConstant{42})), "
+                     "Elemwise{add,no_inplace}(InplaceDimShuffle{1,0}"
                      "(<TensorType(float64, matrix)>), "
-                     "DimShuffle{x,x}(TensorConstant{84})))]")
-
+                     "InplaceDimShuffle{x,x}(TensorConstant{84})))]")
         self.assertTrue(str(new_g) == opt_str_g)
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(check_stack_trace(new_g, ops_to_check='all'))
@@ -202,7 +201,7 @@ class test_dimshuffle_lift(unittest.TestCase):
         x, _, _ = inputs()
         e = ds(x, (0, 1))
         g = FunctionGraph([x], [e])
-        self.assertTrue(str(g) == "[DimShuffle{0,1}(x)]")
+        self.assertTrue(str(g) == "[InplaceDimShuffle{0,1}(x)]")
         dimshuffle_lift.optimize(g)
         self.assertTrue(str(g) == "[x]")
         # Check stacktrace was copied over correctly after opt was applied
@@ -216,38 +215,50 @@ class test_dimshuffle_lift(unittest.TestCase):
         ds_z = ds(z, (2, 1, 0))  # usefull
         ds_u = ds(u, ('x'))  # usefull
         g = FunctionGraph([x, y, z, u], [ds_x, ds_y, ds_z, ds_u])
-        self.assertTrue(str(g) == "[DimShuffle{0,x}(x), DimShuffle{2,1,0}(y), DimShuffle{2,1,0}(z), DimShuffle{x}(TensorConstant{1})]")
+        self.assertTrue(str(g) == "[InplaceDimShuffle{0,x}(x), InplaceDimShuffle{2,1,0}(y), InplaceDimShuffle{2,1,0}(z), InplaceDimShuffle{x}(TensorConstant{1})]")
         dimshuffle_lift.optimize(g)
-        self.assertTrue(str(g) == "[x, y, DimShuffle{2,1,0}(z), DimShuffle{x}(TensorConstant{1})]")
+        self.assertTrue(str(g) == "[x, y, InplaceDimShuffle{2,1,0}(z), InplaceDimShuffle{x}(TensorConstant{1})]")
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(hasattr(g.outputs[0].tag, 'trace'))
 
-    def test_useless_dimshuffle_in_presence_of_reshape(self):
-        vector = TensorType(broadcastable=(False,), dtype='float64')('vector')
-        mat = TensorType(broadcastable=(False, False), dtype='float64')('mat')
-        row = TensorType(broadcastable=(True, False), dtype='float64')('row')
-        col = TensorType(broadcastable=(False, True), dtype='float64')('col')
 
-        reshape_dimshuffle_vector = tensor.reshape(vector.dimshuffle('x', 0), vector.shape)
-        reshape_dimshuffle_mat = tensor.reshape(mat.dimshuffle('x', 0, 'x', 1), mat.shape)
-        reshape_dimshuffle_row = tensor.reshape(row.dimshuffle(1, 'x'), row.shape)
-        reshape_dimshuffle_col = tensor.reshape(col.dimshuffle(0), col.shape)
+def test_local_useless_dimshuffle_in_reshape():
+    vector = TensorType(broadcastable=(False,), dtype='float64')('vector')
+    mat = TensorType(broadcastable=(False, False), dtype='float64')('mat')
+    row = TensorType(broadcastable=(True, False), dtype='float64')('row')
+    col = TensorType(broadcastable=(False, True), dtype='float64')('col')
 
-        g = FunctionGraph([vector, mat, row, col],
-                          [reshape_dimshuffle_vector, reshape_dimshuffle_mat,
-                           reshape_dimshuffle_row, reshape_dimshuffle_col])
+    reshape_dimshuffle_vector = tensor.reshape(vector.dimshuffle('x', 0), vector.shape)
+    reshape_dimshuffle_mat = tensor.reshape(mat.dimshuffle('x', 0, 'x', 1), mat.shape)
+    reshape_dimshuffle_row = tensor.reshape(row.dimshuffle(1, 'x'), row.shape)
+    reshape_dimshuffle_col = tensor.reshape(col.dimshuffle(0), col.shape)
 
-        self.assertTrue(str(g) == "[Reshape{1}(DimShuffle{x,0}(vector), Shape(vector)), "
-                                  "Reshape{2}(DimShuffle{x,0,x,1}(mat), Shape(mat)), "
-                                  "Reshape{2}(DimShuffle{1,x}(row), Shape(row)), "
-                                  "Reshape{2}(DimShuffle{0}(col), Shape(col))]")
-        dimshuffle_lift.optimize(g)
-        self.assertTrue(str(g) == "[Reshape{1}(vector, Shape(vector)), "
-                                  "Reshape{2}(mat, Shape(mat)), "
-                                  "Reshape{2}(row, Shape(row)), "
-                                  "Reshape{2}(col, Shape(col))]")
-        # Check stacktrace was copied over correctly after opt was applied
-        self.assertTrue(hasattr(g.outputs[0].tag, 'trace'))
+    g = FunctionGraph([vector, mat, row, col],
+                      [reshape_dimshuffle_vector, reshape_dimshuffle_mat,
+                       reshape_dimshuffle_row, reshape_dimshuffle_col])
+
+    print(str(g))
+    assert_true(str(g) == "[Reshape{1}(InplaceDimShuffle{x,0}(vector), Shape(vector)), "
+                          "Reshape{2}(InplaceDimShuffle{x,0,x,1}(mat), Shape(mat)), "
+                          "Reshape{2}(InplaceDimShuffle{1,x}(row), Shape(row)), "
+                          "Reshape{2}(InplaceDimShuffle{0}(col), Shape(col))]")
+    useless_dimshuffle_in_reshape = out2in(local_useless_dimshuffle_in_reshape)
+    useless_dimshuffle_in_reshape.optimize(g)
+    assert_true(str(g) == "[Reshape{1}(vector, Shape(vector)), "
+                          "Reshape{2}(mat, Shape(mat)), "
+                          "Reshape{2}(row, Shape(row)), "
+                          "Reshape{2}(col, Shape(col))]")
+
+    # Check stacktrace was copied over correctly after opt was applied
+    assert_true(check_stack_trace(g, ops_to_check='all'))
+
+    # Check that the optimization does not get applied when the order
+    # of dimensions has changed.
+    reshape_dimshuffle_mat2 = tensor.reshape(mat.dimshuffle('x', 1, 'x', 0), mat.shape)
+    h = FunctionGraph([mat], [reshape_dimshuffle_mat2])
+    str_h = str(h)
+    useless_dimshuffle_in_reshape.optimize(h)
+    assert_true(str(h) == str(h))
 
 
 def test_add_canonizer_problem0():
@@ -1383,11 +1394,7 @@ class test_fusion(unittest.TestCase):
 
     def speed_log_exp(self):
         s = slice(31, 36)
-#        linker=gof.CLinker
-        linker = gof.OpWiseCLinker
-        mode = compile.Mode(linker(), copy.copy(compile.mode.OPT_FAST_RUN))
-        mode = compile.ProfileMode()
-        print("time", self.do(mode, shared, shp=(1000, 1000), gpu=False,
+        print("time", self.do(None, shared, shp=(1000, 1000), gpu=False,
                               assert_len_topo=False, slice=s, nb_repeat=100))
 
     def tes_memory_leak(self, mode=compile.mode.Mode('c', 'merge'),
@@ -2034,9 +2041,9 @@ class test_local_subtensor_lift(unittest.TestCase):
                 Subtensor, tensor.DimShuffle]))
 
         prog = f.maker.fgraph.toposort()
-        assert isinstance(prog[0].op, tensor.DimShuffle)
-        assert isinstance(prog[1].op, tensor.Subtensor)  # first subtensor
-        assert isinstance(prog[2].op, tensor.Subtensor)  # first subtensor
+        assert isinstance(prog[0].op, tensor.Subtensor)
+        assert isinstance(prog[1].op, tensor.DimShuffle)
+        assert isinstance(prog[2].op, tensor.Subtensor)
         assert isinstance(prog[3].op.scalar_op, theano.scalar.
                           Composite)  # Composite{add,add}
         assert len(prog) == 4
@@ -2055,9 +2062,9 @@ class test_local_subtensor_lift(unittest.TestCase):
                 Subtensor, tensor.DimShuffle]))
 
         prog = f.maker.fgraph.toposort()
-        assert isinstance(prog[0].op, tensor.DimShuffle)
-        assert isinstance(prog[1].op, tensor.Subtensor)  # first subtensor
-        assert isinstance(prog[2].op, tensor.Subtensor)  # first subtensor
+        assert isinstance(prog[0].op, tensor.Subtensor)
+        assert isinstance(prog[1].op, tensor.DimShuffle)
+        assert isinstance(prog[2].op, tensor.Subtensor)
         assert isinstance(prog[3].op.scalar_op, theano.scalar.
                           Composite)  # Composite{add,add}
         assert len(prog) == 4
@@ -3161,7 +3168,7 @@ class Test_local_elemwise_alloc(unittest.TestCase):
         # Exclude local_useless_alloc, since it does not introduce
         # assert in all the same cases.
         self.fast_run_mode = self.fast_run_mode.excluding(
-            'local_useless_alloc')
+            'local_useless_alloc', 'local_canonicalize_alloc')
         # No optimization on alloc
         func = function(
             [self.vec, self.mat],
@@ -3419,6 +3426,9 @@ def test_local_fill_useless():
 
 
 class Test_local_useless_elemwise_comparison(unittest.TestCase):
+    def setUp(self):
+        self.rng = numpy.random.RandomState(utt.fetch_seed())
+
     def test_local_useless_elemwise_comparison(self):
         # TODO: test each case individually.
         # The following case is what made me discover those cases.
@@ -3456,6 +3466,8 @@ class Test_local_useless_elemwise_comparison(unittest.TestCase):
 
         mode = theano.compile.get_default_mode().excluding('fusion')
         f = theano.function([X, Y], Z, mode=mode)
+        f(self.rng.rand(2, 3).astype(config.floatX),
+          self.rng.rand(2).astype(config.floatX))
         # theano.printing.debugprint(f, print_type=True)
         # here is the output for the debug print:
         """
@@ -3558,9 +3570,15 @@ class Test_local_useless_elemwise_comparison(unittest.TestCase):
 
         f = theano.function([x], T.minimum(x.shape[0], 0), mode=mode)
         self.assert_eqs_const(f, 0)
+        assert f(x_val) == 0
 
         f = theano.function([x], T.minimum(0, x.shape[0]), mode=mode)
         self.assert_eqs_const(f, 0)
+        assert f(x_val) == 0
+        f = theano.function([x], T.minimum([0, 0], x.shape[0]), mode=mode)
+        # This case isn't optimized.
+#        self.assert_eqs_const(f, 0)
+        utt.assert_allclose(f(x_val), [0, 0])
 
     def test_shape_add_inequality(self):
         x = T.vector('x', dtype=config.floatX)
@@ -3609,33 +3627,39 @@ class Test_local_useless_elemwise_comparison(unittest.TestCase):
 
         x = T.scalar('x', dtype='int8')
 
-        f = theano.function([x], T.and_(x, 0), mode=mode)
-        self.assert_eqs_const(f, 0)
+        for zero, one in [(numpy.int8(0), numpy.int8(1)), (0, 1)]:
+            f = theano.function([x], T.and_(x, zero), mode=mode)
+            self.assert_eqs_const(f, 0)
 
-        f = theano.function([x], T.and_(0, x), mode=mode)
-        self.assert_eqs_const(f, 0)
+            f = theano.function([x], T.and_(zero, x), mode=mode)
+            self.assert_eqs_const(f, 0)
 
-        f = theano.function([x], T.and_(x, 1), mode=mode)
-        self.assert_identity(f)
+            f = theano.function([x], T.and_(x, one), mode=mode)
+            if f.outputs[0].variable.dtype == x.dtype:
+                self.assert_identity(f)
 
-        f = theano.function([x], T.and_(1, x), mode=mode)
-        self.assert_identity(f)
+            f = theano.function([x], T.and_(one, x), mode=mode)
+            if f.outputs[0].variable.dtype == x.dtype:
+                self.assert_identity(f)
 
     def test_or(self):
         mode = theano.compile.get_default_mode().including('canonicalize')
         x = T.scalar('x', dtype='int8')
 
-        f = theano.function([x], T.or_(x, 1), mode=mode)
-        self.assert_eqs_const(f, 1)
+        for zero, one in [(numpy.int8(0), numpy.int8(1)), (0, 1)]:
+            f = theano.function([x], T.or_(x, one), mode=mode)
+            self.assert_eqs_const(f, 1)
 
-        f = theano.function([x], T.or_(1, x), mode=mode)
-        self.assert_eqs_const(f, 1)
+            f = theano.function([x], T.or_(one, x), mode=mode)
+            self.assert_eqs_const(f, 1)
 
-        f = theano.function([x], T.or_(x, 0), mode=mode)
-        self.assert_identity(f)
+            f = theano.function([x], T.or_(x, zero), mode=mode)
+            if f.outputs[0].variable.dtype == x.dtype:
+                self.assert_identity(f)
 
-        f = theano.function([x], T.or_(0, x), mode=mode)
-        self.assert_identity(f)
+            f = theano.function([x], T.or_(zero, x), mode=mode)
+            if f.outputs[0].variable.dtype == x.dtype:
+                self.assert_identity(f)
 
     def test_xor(self):
         mode = theano.compile.get_default_mode().including('canonicalize')
@@ -3645,7 +3669,7 @@ class Test_local_useless_elemwise_comparison(unittest.TestCase):
         self.assert_eqs_const(f, 0)
 
 
-class Test_local_useless_alloc(unittest.TestCase):
+class Test_local_canonicalize_alloc(unittest.TestCase):
     def setUp(self):
         self.rng = numpy.random.RandomState(utt.fetch_seed())
 
@@ -3667,11 +3691,11 @@ class Test_local_useless_alloc(unittest.TestCase):
             self.assertRaises(ValueError, f)
 
         # No need to check_stack_trace as the optimization
-        # local_useless_alloc only removes nodes.
+        # local_canonicalize_alloc only removes nodes.
 
     def test1(self):
         # Test that alloc never gets instantiated during optimization
-        mode = mode_opt.excluding('local_useless_alloc')
+        mode = mode_opt.excluding('local_canonicalize_alloc')
 
         x = tensor.matrix('x')
         xx = tensor.fill(x, x)
@@ -3683,11 +3707,11 @@ class Test_local_useless_alloc(unittest.TestCase):
         assert tensor.Alloc not in op_classes
 
         # No need to check_stack_trace as the optimization
-        # local_useless_alloc only removes nodes.
+        # local_canonicalize_alloc only removes nodes.
 
     def test2(self):
         # Test that alloc never gets instantiated during optimization
-        mode = mode_opt.excluding('local_useless_alloc')
+        mode = mode_opt.excluding('local_canonicalize_alloc')
 
         x = tensor.matrix('x')
         y = tensor.tile(x, (1,)*2)
@@ -3705,7 +3729,7 @@ class Test_local_useless_alloc(unittest.TestCase):
         # The correct opt removes nodes, no need for check_stack_trace
 
     def test_useless_alloc_with_shape_one(self):
-        alloc_lift = out2in(local_useless_alloc)
+        alloc_lift = out2in(local_canonicalize_alloc)
         x = shared(self.rng.randn(2,))
         y = shared(self.rng.randn())
         z = shared(self.rng.randn(1, 1))
@@ -3735,15 +3759,15 @@ class Test_local_useless_alloc(unittest.TestCase):
                                    "TensorConstant{2})]"))
 
         alloc_lift.optimize(g)
-        self.assertTrue(str(g) == "[DimShuffle{x,0,1}"
+        self.assertTrue(str(g) == "[InplaceDimShuffle{x,0,1}"
                                   "(Alloc(<TensorType(float64, vector)>, "
                                   "TensorConstant{3}, "
                                   "TensorConstant{2})), "
 
-                                  "DimShuffle{x,x}"
+                                  "InplaceDimShuffle{x,x}"
                                   "(<TensorType(float64, scalar)>), "
 
-                                  "DimShuffle{x,0,1}"
+                                  "InplaceDimShuffle{x,0,1}"
                                   "(Alloc(<TensorType(float64, matrix)>, "
                                   "TensorConstant{1}, "
                                   "TensorConstant{2})), "
@@ -4216,23 +4240,31 @@ def test_local_mul_specialize():
 
 class T_Tile(unittest.TestCase):
     def test_local_useless_tile(self):
-        # Tile op is deprecated so the tile function doesn't use it
-        # anymore, we'll test here the op directly
         v = T.vector()
         m = T.matrix()
         mode = None
         if theano.config.mode == "FAST_COMPILE":
             mode = "FAST_RUN"
         for var, data in [(v, [1, 2, 3]), (m, [[1, 2], [3, 4]])]:
-            # Currently, only a repeat patter == ndim is supported.
-            for ndim in [var.ndim]:  # range(1, var.ndim):
-                f = theano.function([var], Tile(ndim)(var, (1,)*ndim), mode=mode)
+            # When len(repeat pattern) <= var.ndim, everything is removed
+            # for ndim in range(1, var.ndim):
+            for ndim in range(var.ndim + 1):
+                f = theano.function([var], tile(var, (1,) * ndim), mode=mode)
                 topo = f.maker.fgraph.toposort()
                 assert len(topo) == 1
                 assert isinstance(topo[0].op, compile.DeepCopyOp)
                 f(data)
                 # In this case the opt only removes nodes,
                 # no need to check_stack_trace
+            # When len(repeat pattern) > var.ndim, only a dimshuffle should be
+            # left, but there can be a DeepCopy as well
+            for ndim in range(var.ndim + 1, var.ndim + 3):
+                f = theano.function([var], tile(var, (1,) * ndim), mode=mode)
+                topo = f.maker.fgraph.toposort()
+                assert len(topo) <= 2
+                assert isinstance(topo[0].op, DimShuffle)
+                assert check_stack_trace(f, ops_to_check=[DimShuffle])
+                f(data)
 
 
 def speed_local_pow_specialize_range():
@@ -6163,14 +6195,80 @@ class Test_Reshape(unittest.TestCase):
         assert sum(isinstance(node.op, self.op) for node in topo) == 1
 
 
-def test_local_useless_reshape():
-    mode = theano.compile.get_default_mode().including(
+class Test_local_useless_reshape(unittest.TestCase):
+    def setUp(self):
+        self.rng = numpy.random.RandomState(utt.fetch_seed())
+
+    def test_0(self):
+        mode = theano.compile.get_default_mode().including(
             'local_useless_reshape')
-    i = T.iscalar('i')
-    m = theano.tensor.mgrid[0:i,]
-    f = theano.function([i], m, mode=mode)
-    topo = f.maker.fgraph.toposort()
-    assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+        i = T.iscalar('i')
+        m = theano.tensor.mgrid[0:i,]
+        f = theano.function([i], m, mode=mode)
+        topo = f.maker.fgraph.toposort()
+        assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+
+    def test_1(self):
+        x = theano.tensor.matrix('x')
+        r = x.reshape(x.shape)
+
+        m0 = theano.compile.get_default_mode()
+        m1 = m0.including('local_useless_reshape')
+        f1 = theano.function([x], r, mode=m1)
+        topo = f1.maker.fgraph.toposort()
+        assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+
+        m2 = m1.excluding('ShapeOpt')
+        f2 = theano.function([x], r, mode=m2)
+        topo = f2.maker.fgraph.toposort()
+        assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+
+    def test_2(self):
+        x = theano.tensor.matrix('x')
+        r = x.reshape([Shape_i(i)(x) for i in xrange(x.ndim)])
+
+        m0 = theano.compile.get_default_mode()
+        m1 = m0.including('local_useless_reshape')
+        f1 = theano.function([x], r, mode=m1)
+        topo = f1.maker.fgraph.toposort()
+        assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+
+        m2 = m1.excluding('ShapeOpt')
+        f2 = theano.function([x], r, mode=m2)
+        topo = f2.maker.fgraph.toposort()
+        assert not any(isinstance(n.op, tensor.basic.Reshape) for n in topo)
+
+
+class Test_local_reshape_to_dimshuffle(unittest.TestCase):
+    def setUp(self):
+        self.rng = numpy.random.RandomState(utt.fetch_seed())
+
+    def test_1(self):
+        reshape_lift = out2in(local_reshape_to_dimshuffle)
+        useless_reshape = out2in(local_useless_reshape)
+        x = shared(self.rng.randn(4,))
+        y = shared(self.rng.randn(5, 6))
+        reshape_x = tensor.reshape(x, (1, 4))
+        reshape_y = tensor.reshape(y, (1, 5, 1, 6, 1, 1))
+
+        g = FunctionGraph([x, y], [reshape_x, reshape_y])
+        self.assertTrue(str(g) == ("[Reshape{2}"
+                                   "(<TensorType(float64, vector)>, "
+                                   "TensorConstant{[1 4]}), "
+                                   "Reshape{6}"
+                                   "(<TensorType(float64, matrix)>, "
+                                   "TensorConstant{[1 5 1 6 1 1]})]"))
+
+        reshape_lift.optimize(g)
+        useless_reshape.optimize(g)
+        self.assertTrue(str(g) == "[InplaceDimShuffle{x,0}"
+                                  "(<TensorType(float64, vector)>), "
+                                  "InplaceDimShuffle{x,0,x,1,x,x}"
+                                  "(Reshape{2}(<TensorType(float64, matrix)>, "
+                                  "TensorConstant{[5 6]}))]")
+
+        # Check stacktrace was copied over correctly after opt was applied
+        check_stack_trace(g, ops_to_check=(T.DimShuffle, T.Reshape))
 
 
 def test_local_reshape_lift():
@@ -6196,7 +6294,7 @@ class Test_lift_transpose_through_dot(unittest.TestCase):
     def test_matrix_matrix(self):
         a, b = matrices('ab')
         g = self.simple_optimize(FunctionGraph([a, b], [tensor.dot(a, b).T]))
-        sg = '[dot(DimShuffle{1,0}(b), DimShuffle{1,0}(a))]'
+        sg = '[dot(InplaceDimShuffle{1,0}(b), InplaceDimShuffle{1,0}(a))]'
         assert str(g) == sg, (str(g), sg)
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(check_stack_trace(g, ops_to_check='all'))
@@ -6208,7 +6306,7 @@ class Test_lift_transpose_through_dot(unittest.TestCase):
             [a, b],
             [tensor.dot(a.dimshuffle('x', 0), b).T]),
             level='stabilize')
-        sg = '[dot(DimShuffle{1,0}(b), DimShuffle{0,x}(a))]'
+        sg = '[dot(InplaceDimShuffle{1,0}(b), InplaceDimShuffle{0,x}(a))]'
         assert str(g) == sg, (str(g), sg)
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(check_stack_trace(g, ops_to_check='all'))
@@ -6220,7 +6318,7 @@ class Test_lift_transpose_through_dot(unittest.TestCase):
             [a, b],
             [tensor.dot(b, a.dimshuffle(0, 'x')).T]),
             level='stabilize')
-        sg = '[dot(DimShuffle{x,0}(a), DimShuffle{1,0}(b))]'
+        sg = '[dot(InplaceDimShuffle{x,0}(a), InplaceDimShuffle{1,0}(b))]'
         assert str(g) == sg, (str(g), sg)
         # Check stacktrace was copied over correctly after opt was applied
         self.assertTrue(check_stack_trace(g, ops_to_check='all'))
@@ -6495,6 +6593,137 @@ def test_local_merge_alloc():
     o = f(0., 1, 2, 2, 3, 4)
     assert o.shape == (1, 2, 3, 4)
     assert_raises((AssertionError, ValueError), f, 0., 1, 2, 5, 3, 4)
+
+
+def test_local_useless_alloc():
+
+    useless_alloc = out2in(local_useless_alloc)
+    merge_alloc = out2in(local_merge_alloc)
+
+    x = T.iscalar('x')
+    y = T.iscalar('y')
+    y2 = T.iscalar('y2')
+    z = T.iscalar('z')
+    w = T.iscalar('w')
+    m = T.fscalar('m')
+
+    # case 1
+    # Alloc(Alloc(m, x, 1, 1, 1), x, y, z, w) -> Alloc(m, x, y, z, w)
+    output = T.alloc(T.alloc(m, 1, y, 1, 1), x, y, z, w)
+    g = FunctionGraph([m, x, y, z, w], [output])
+
+    useless_alloc.optimize(g)
+    merge_alloc.optimize(g)
+    useless_alloc.optimize(g)
+
+    topo = g.toposort()
+    assert len(topo) == 1
+    assert isinstance(topo[0].op, T.Alloc)
+
+    # case 2
+    # Alloc(Alloc(m, y, 1, 1), x, y, z, w) -> Alloc(m, x, y, z, w)
+    output = T.alloc(T.alloc(m, y, 1, 1), x, y, z, w)
+    g = FunctionGraph([m, x, y, z, w], [output])
+
+    useless_alloc.optimize(g)
+    merge_alloc.optimize(g)
+    useless_alloc.optimize(g)
+
+    topo = g.toposort()
+    assert len(topo) == 1
+    assert isinstance(topo[0].op, T.Alloc)
+
+    # case 3
+    # Alloc(Alloc(m, y1, 1, 1), x, y2, z, w) ->
+    #   Alloc(m, x, assert(y1, y1==y2), z, w)
+    output = T.alloc(T.alloc(m, y, 1, 1), x, y2, z, w)
+    g = FunctionGraph([m, x, y, y2, z, w], [output])
+
+    useless_alloc.optimize(g)
+    merge_alloc.optimize(g)
+    useless_alloc.optimize(g)
+
+    topo = g.toposort()
+    assert len(topo) == 3
+    assert isinstance(topo[-2].op, T.opt.Assert)
+    assert isinstance(topo[-1].op, T.Alloc)
+
+
+def compile_graph_log_sum_exp(x, axis, dimshuffle_op=None):
+    sum_exp = T.sum(T.exp(x), axis=axis)
+    if dimshuffle_op:
+        sum_exp = dimshuffle_op(sum_exp)
+    y = T.log(sum_exp)
+    MODE = theano.compile.get_default_mode().including('local_log_sum_exp')
+    return function([x], y, mode=MODE)
+
+
+def check_max_log_sum_exp(x, axis, dimshuffle_op=None):
+    f = compile_graph_log_sum_exp(x, axis, dimshuffle_op)
+
+    fgraph = f.maker.fgraph.toposort()
+    for node in fgraph:
+        if (hasattr(node.op, 'scalar_op') and
+                node.op.scalar_op == theano.scalar.basic.maximum):
+            return
+
+        # in mode FAST_COMPILE, the optimisations don't replace the
+        # MaxAndArgmax op.
+        if isinstance(node.op, theano.tensor.MaxAndArgmax):
+            return
+
+    raise Exception('No maximum detected after log_sum_exp optimisation')
+
+
+def test_local_log_sum_exp1():
+    # Tests if optimization is applied by checking the presence of the maximum
+    x = tensor3('x')
+    check_max_log_sum_exp(x, axis=(0,), dimshuffle_op=None)
+    check_max_log_sum_exp(x, axis=(1,), dimshuffle_op=None)
+    check_max_log_sum_exp(x, axis=(2,), dimshuffle_op=None)
+    check_max_log_sum_exp(x, axis=(0, 1), dimshuffle_op=None)
+    check_max_log_sum_exp(x, axis=(0, 1, 2), dimshuffle_op=None)
+
+    # If a transpose is applied to the sum
+    transpose_op = DimShuffle((False, False), (1, 0))
+    check_max_log_sum_exp(x, axis=2, dimshuffle_op=transpose_op)
+
+    # If the sum is performed with keepdims=True
+    x = TensorType(dtype='floatX', broadcastable=(False, True, False))('x')
+    sum_keepdims_op = x.sum(axis=(0, 1), keepdims=True).owner.op
+    check_max_log_sum_exp(x, axis=(0, 1), dimshuffle_op=sum_keepdims_op)
+
+
+def test_local_log_sum_exp2():
+    # Tests if the optimization works (result is correct) around 1.0
+
+    x = tensor3('x')
+    x_val = 1.0 + numpy.random.rand(4, 3, 2).astype(config.floatX) / 10.0
+
+    f = compile_graph_log_sum_exp(x, axis=(1,))
+    naive_ret = numpy.log(numpy.sum(numpy.exp(x_val), axis=1))
+    optimised_ret = f(x_val)
+    assert numpy.allclose(naive_ret, optimised_ret)
+
+    # If a transpose is applied
+    transpose_op = DimShuffle((False, False), (1, 0))
+    f = compile_graph_log_sum_exp(x, axis=(1,), dimshuffle_op=transpose_op)
+    naive_ret = numpy.log(numpy.sum(numpy.exp(x_val), axis=1).T)
+    optimised_ret = f(x_val)
+
+    assert numpy.allclose(naive_ret, optimised_ret)
+
+
+def test_local_log_sum_exp3():
+    # Tests if the optimization works (result is correct) for extreme value 100
+    x = vector('x')
+    f = compile_graph_log_sum_exp(x, axis=0)
+
+    x_val = numpy.array([-100., 100.]).astype(config.floatX)
+
+    optimised_ret = f(x_val)
+
+    assert numpy.allclose(optimised_ret, 100.)
 
 
 if __name__ == '__main__':

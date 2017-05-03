@@ -72,7 +72,7 @@ def check_equal_numpy(x, y):
     """
     if isinstance(x, numpy.ndarray) and isinstance(y, numpy.ndarray):
         return (x.dtype == y.dtype and x.shape == y.shape and
-                numpy.any(abs(x - y) < 1e-10))
+                numpy.all(abs(x - y) < 1e-10))
     elif (isinstance(x, numpy.random.RandomState) and
           isinstance(y, numpy.random.RandomState)):
         return python_all(numpy.all(a == b) for a, b in
@@ -302,7 +302,7 @@ class NumpyAutocaster(object):
         # returns either an exact x_==x, or the last cast x_
         return x_
 
-autocast_int = NumpyAutocaster(('int8', 'int16', 'int32', 'int64'))
+autocast_int = NumpyAutocaster(('int16', 'int32', 'int64'))
 autocast_float = NumpyAutocaster(('float16', 'float32', 'float64'))
 
 
@@ -390,7 +390,8 @@ def constant_or_value(x, rtype, name=None, ndim=None, dtype=None):
             # it will only work if the long fits in int64. For NumPy 1.7.1+,
             # it will work if the long fits in int64 or uint64.
             x_ = numpy.asarray(x)
-
+            if x_.size == 0 and not hasattr(x, 'dtype'):
+                x_ = numpy.asarray(x, dtype=config.floatX)
     assert type(x_) in [numpy.ndarray, numpy.memmap]
 
     bcastable = [d == 1 for d in x_.shape]
@@ -463,8 +464,8 @@ if int(config.tensor.cmp_sloppy) > 1:
     # When config.tensor.cmp_sloppy>1 we are even more sloppy. This is
     # useful to test the GPU as they don't use extended precision and
     # this cause some difference bigger then the normal sloppy.
-    float16_atol = 5e-3
-    float16_rtol = 1e-2
+    float16_atol = 1e-2
+    float16_rtol = 5e-2
 
     float32_atol = 5e-4
     float32_rtol = 1e-3
@@ -472,8 +473,8 @@ if int(config.tensor.cmp_sloppy) > 1:
     float64_rtol = 1e-4
     float64_atol = 1e-3
 elif int(config.tensor.cmp_sloppy):
-    float16_atol = 1e-3
-    float16_rtol = 5e-3
+    float16_atol = 5e-3
+    float16_rtol = 1e-2
 
     float32_atol = 1e-4
     float32_rtol = 1e-3
@@ -483,8 +484,8 @@ elif int(config.tensor.cmp_sloppy):
 else:
     # If you change those value in test don't forget to put them back
     # when the test end.  Don't forget the case when the test fail.
-    float16_atol = 5e-4
-    float16_rtol = 5e-4
+    float16_atol = 1e-3
+    float16_rtol = 1e-3
 
     float32_atol = 1e-5
     float32_rtol = 1e-5
@@ -576,7 +577,8 @@ get_scalar_constant_value_elemwises = (
 
 
 def get_scalar_constant_value(orig_v, elemwise=True,
-                              only_process_constants=False):
+                              only_process_constants=False,
+                              max_recur=10):
     """Return the constant scalar(0-D) value underlying variable `v`.
 
     If `v` is the output of dimshuffles, fills, allocs, rebroadcasts,
@@ -596,6 +598,8 @@ def get_scalar_constant_value(orig_v, elemwise=True,
         If True, we only attempt to obtain the value of `orig_v` if it's
         directly constant and don't try to dig through dimshuffles, fills,
         allocs, and other to figure out its value.
+    max_recur : int
+        The maximum number of recursion.
 
     Notes
     -----
@@ -623,7 +627,10 @@ def get_scalar_constant_value(orig_v, elemwise=True,
                 data = v.data
             return numpy_scalar(data).copy()
 
-        if not only_process_constants and getattr(v, 'owner', None):
+        if (not only_process_constants and
+                getattr(v, 'owner', None) and
+                max_recur > 0):
+            max_recur -= 1
             if isinstance(v.owner.op, (Alloc, DimShuffle, Rebroadcast,
                                        compile.ops.OutputGuard,
                                        compile.DeepCopyOp)):
@@ -645,7 +652,8 @@ def get_scalar_constant_value(orig_v, elemwise=True,
             # We put all the scalar Ops used by get_canonical_form_slice()
             # to allow it to determine the broadcast pattern correctly.
             elif isinstance(v.owner.op, (ScalarFromTensor, TensorFromScalar)):
-                return get_scalar_constant_value(v.owner.inputs[0])
+                v = v.owner.inputs[0]
+                continue
             elif isinstance(v.owner.op, scal.ScalarOp):
                 if isinstance(v.owner.op, scal.Second):
                     # We don't need both input to be constant for second
@@ -653,7 +661,7 @@ def get_scalar_constant_value(orig_v, elemwise=True,
                     v = val
                     continue
                 if isinstance(v.owner.op, get_scalar_constant_value_elemwises):
-                    const = [get_scalar_constant_value(i)
+                    const = [get_scalar_constant_value(i, max_recur=max_recur)
                              for i in v.owner.inputs]
                     ret = [[None]]
                     v.owner.op.perform(v.owner, const, ret)
@@ -670,7 +678,7 @@ def get_scalar_constant_value(orig_v, elemwise=True,
                 elif elemwise and isinstance(
                         v.owner.op.scalar_op,
                         get_scalar_constant_value_elemwises):
-                    const = [get_scalar_constant_value(i)
+                    const = [get_scalar_constant_value(i, max_recur=max_recur)
                              for i in v.owner.inputs]
                     ret = [[None]]
                     v.owner.op.perform(v.owner, const, ret)
@@ -705,27 +713,33 @@ def get_scalar_constant_value(orig_v, elemwise=True,
                                   v.owner.inputs[0].owner.inputs[1:]):
                         idx = v.owner.op.idx_list[0]
                         if isinstance(idx, gof.Type):
-                            idx = get_scalar_constant_value(v.owner.inputs[1])
+                            idx = get_scalar_constant_value(v.owner.inputs[1],
+                                                            max_recur=max_recur)
                         # Note the '+ 1' is because the first argument to Join
                         # is the axis.
                         ret = v.owner.inputs[0].owner.inputs[idx + 1]
-                        ret = get_scalar_constant_value(ret)
+                        ret = get_scalar_constant_value(ret, max_recur=max_recur)
                         # join can cast implicitly its input in some case.
                         return theano._asarray(ret, dtype=v.type.dtype)
                     if python_all(var.ndim == 1 for var in
                                   v.owner.inputs[0].owner.inputs[1:]):
                         idx = v.owner.op.idx_list[0]
                         if isinstance(idx, gof.Type):
-                            idx = get_scalar_constant_value(v.owner.inputs[1])
+                            idx = get_scalar_constant_value(v.owner.inputs[1],
+                                                            max_recur=max_recur)
                         try:
                             # TODO: assert joined axis is 0.
                             length = 0
+                            loop = False
                             for joined in v.owner.inputs[0].owner.inputs[1:]:
                                 ll = get_vector_length(joined)
                                 if idx < length + ll:
-                                    return get_scalar_constant_value(
-                                        joined[idx - length])
+                                    v = joined[idx - length]
+                                    loop = True
+                                    break
                                 length += ll
+                            if loop:
+                                continue
                         except TypeError:
                             pass
                         except ValueError:
@@ -742,12 +756,13 @@ def get_scalar_constant_value(orig_v, elemwise=True,
 
                     idx = v.owner.op.idx_list[0]
                     if isinstance(idx, gof.Type):
-                        idx = get_scalar_constant_value(v.owner.inputs[1])
+                        idx = get_scalar_constant_value(v.owner.inputs[1],
+                                                        max_recur=max_recur)
                     # Python 2.4 does not support indexing with numpy.integer
                     # So we cast it.
                     idx = int(idx)
                     ret = v.owner.inputs[0].owner.inputs[idx]
-                    ret = get_scalar_constant_value(ret)
+                    ret = get_scalar_constant_value(ret, max_recur=max_recur)
                     # MakeVector can cast implicitly its input in some case.
                     return theano._asarray(ret, dtype=v.type.dtype)
 
@@ -762,7 +777,8 @@ def get_scalar_constant_value(orig_v, elemwise=True,
                     idx_list = op.idx_list
                     idx = idx_list[0]
                     if isinstance(idx, gof.Type):
-                        idx = get_scalar_constant_value(owner.inputs[1])
+                        idx = get_scalar_constant_value(owner.inputs[1],
+                                                        max_recur=max_recur)
                     grandparent = leftmost_parent.owner.inputs[0]
                     gp_broadcastable = grandparent.type.broadcastable
                     ndim = grandparent.type.ndim
@@ -1029,6 +1045,34 @@ def tensor4(name=None, dtype=None):
     return type(name)
 tensor4s, ftensor4s, dtensor4s, itensor4s, ltensor4s = _multi(
     tensor4, ftensor4, dtensor4, itensor4, ltensor4)
+
+ctensor5 = TensorType('complex64', ((False,) * 5))
+ztensor5 = TensorType('complex128', ((False,) * 5))
+ftensor5 = TensorType('float32', ((False,) * 5))
+dtensor5 = TensorType('float64', ((False,) * 5))
+btensor5 = TensorType('int8', ((False,) * 5))
+wtensor5 = TensorType('int16', ((False,) * 5))
+itensor5 = TensorType('int32', ((False,) * 5))
+ltensor5 = TensorType('int64', ((False,) * 5))
+
+
+def tensor5(name=None, dtype=None):
+    """Return a symbolic 5-D variable.
+
+    Parameters
+    ----------
+    dtype: numeric type
+        None means to use theano.config.floatX.
+    name
+        A name to attach to this variable.
+
+    """
+    if dtype is None:
+        dtype = config.floatX
+    type = TensorType(dtype, (False, False, False, False, False))
+    return type(name)
+tensor5s, ftensor5s, dtensor5s, itensor5s, ltensor5s = _multi(
+    tensor5, ftensor5, dtensor5, itensor5, ltensor5)
 
 
 Tensor = TensorType
@@ -1378,8 +1422,10 @@ class MaxAndArgmax(Op):
                                 dtype='int64')
         # Not-reduced axes in front
         transposed_x = numpy.transpose(x, numpy.concatenate((keep_axes, axes)))
-        reshaped_x = transposed_x.reshape(transposed_x.shape[:len(keep_axes)] +
-                                          (-1,))
+        kept_shape = transposed_x.shape[:len(keep_axes)]
+        reduced_shape = transposed_x.shape[len(keep_axes):]
+        new_shape = kept_shape + (numpy.prod(reduced_shape),)
+        reshaped_x = transposed_x.reshape(new_shape)
 
         max_idx[0] = theano._asarray(numpy.argmax(reshaped_x, axis=-1),
                                      dtype='int64')
@@ -2270,12 +2316,15 @@ pprint.assign(fill, printing.FunctionPrinter('fill'))
 
 
 @constructor
-def ones_like(model, dtype=None):
+def ones_like(model, dtype=None, opt=False):
     """equivalent of numpy.ones_like
     Parameters
     ----------
     model : tensor
     dtype : data-type, optional
+    opt : If True, we will return a constant instead of a graph when possible.
+          Useful for Theano optimization, not for user building a graph as this
+          have the consequence that model isn't always in the graph.
 
     Returns
     -------
@@ -2284,17 +2333,22 @@ def ones_like(model, dtype=None):
     """
     if dtype is None:
         dtype = model.type.dtype
-    ret = fill(model, constant(1.0, dtype=dtype))
-    return ret
+    ret = constant(1.0, dtype=dtype)
+    if opt and ret.type == model.type:
+        return ret
+    return fill(model, ret)
 
 
 @constructor
-def zeros_like(model, dtype=None):
+def zeros_like(model, dtype=None, opt=False):
     """equivalent of numpy.zeros_like
     Parameters
     ----------
     model : tensor
     dtype : data-type, optional
+    opt : If True, we will return a constant instead of a graph when possible.
+          Useful for Theano optimization, not for user building a graph as this
+          have the consequence that model isn't always in the graph.
 
     Returns
     -------
@@ -2304,7 +2358,10 @@ def zeros_like(model, dtype=None):
 
     if dtype is None:
         dtype = model.type.dtype
-    return fill(model, constant(0.0, dtype=dtype))
+    ret = constant(0.0, dtype=dtype)
+    if opt and ret.type == model.type:
+        return ret
+    return fill(model, ret)
 
 
 def zeros(shape, dtype=None):
@@ -2672,6 +2729,36 @@ def identity_like(x):
     return eye(x.shape[0], x.shape[1], k=0, dtype=x.dtype)
 
 
+def alloc_validate_shape(shape):
+    sh = [as_tensor_variable(s) for s in shape]
+    bcast = []
+    for i, s in enumerate(sh):
+        def err_str():
+            if config.exception_verbosity == 'high':
+                return '\n' + min_informative_str(s)
+            else:
+                return str(s)
+        if s.type.dtype[:3] not in ('int', 'uin'):
+            s_as_str = err_str()
+            raise TypeError('Shape arguments to Alloc must be integers, '
+                            'but argument %s is not for apply node: %s' %
+                            (i, s_as_str))
+        if s.ndim != 0:
+            s_as_str = err_str()
+            raise TypeError(
+                "Each shape dimension to Alloc must be a scalar, ",
+                'but dimension %s have %d dimensions for apply node: %s' %
+                (i, s.ndim, s_as_str))
+
+        # if s is constant 1, then we're broadcastable in that dim
+        try:
+            const_shp = get_scalar_constant_value(s)
+        except NotScalarConstantError:
+            const_shp = None
+        bcast.append(1 == const_shp)
+    return sh, bcast
+
+
 class Alloc(gof.Op):
     """Create a Tensor from an initial value and a desired shape.
 
@@ -2690,40 +2777,15 @@ class Alloc(gof.Op):
     are lifted, the first argument to fill can often be pruned from the graph.
 
     """
+    _f16_ok = True
     __props__ = ()
 
     def validate_shape(self, shape):
-        sh = [as_tensor_variable(s) for s in shape]
-        bcast = []
-        for i, s in enumerate(sh):
-            def err_str():
-                if config.exception_verbosity == 'high':
-                    return '\n' + min_informative_str(s)
-                else:
-                    return str(s)
-            if s.type.dtype[:3] not in ('int', 'uin'):
-                s_as_str = err_str()
-                raise TypeError('Shape arguments to Alloc must be integers, '
-                                'but argument %s is not for apply node: %s' %
-                                (i, s_as_str))
-            if s.ndim != 0:
-                s_as_str = err_str()
-                raise TypeError(
-                    "Each shape dimension to Alloc must be a scalar, ",
-                    'but dimension %s have %d dimensions for apply node: %s' %
-                    (i, s.ndim, s_as_str))
-
-            # if s is constant 1, then we're broadcastable in that dim
-            try:
-                const_shp = get_scalar_constant_value(s)
-            except NotScalarConstantError:
-                const_shp = None
-            bcast.append(1 == const_shp)
-        return sh, bcast
+        return alloc_validate_shape(shape)
 
     def make_node(self, value, *shape):
         v = as_tensor_variable(value)
-        sh, bcast = self.validate_shape(shape)
+        sh, bcast = alloc_validate_shape(shape)
         if v.ndim > len(sh):
             raise TypeError("The Alloc value to use has more dimensions"
                             " than the specified dimensions",
@@ -2780,13 +2842,14 @@ class Alloc(gof.Op):
             }
 
             // This function takes care of broadcasting
-            PyArray_CopyInto(%(zz)s, %(vv)s);
+            if (PyArray_CopyInto(%(zz)s, %(vv)s) == -1)
+              %(fail)s
             """ % dict(vv=vv, ndim=ndim, zz=zz, fail=fail)
 
         return code
 
     def c_code_cache_version(self):
-        return (1,)
+        return (2,)
 
     def infer_shape(self, node, input_shapes):
         return [node.inputs[1:]]
@@ -3135,7 +3198,7 @@ def mean(input, axis=None, dtype=None, op=False, keepdims=False,
 
 
 @constructor
-def var(input, axis=None, keepdims=False):
+def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
     """
     Computes the variance along the given axis(es) of a tensor `input`.
 
@@ -3144,19 +3207,30 @@ def var(input, axis=None, keepdims=False):
     axis: None or int or (list of int) (see `Sum`)
         Compute the variance along this axis of the tensor.
         None means all axes (like numpy).
+    ddof: Degrees of freedom; 0 would compute the ML estimate, 1 would compute
+        the unbiased estimate.
     keepdims : bool
         If this is set to True, the axes which are reduced are
         left in the result as dimensions with size one. With this option,
         the result will broadcast correctly against the original tensor.
+    corrected : bool
+        If this is set to True, the 'corrected_two_pass' algorithm is
+        used to compute the variance.
+        Refer : http://www.cs.yale.edu/publications/techreports/tr222.pdf
 
     Notes
     -----
-    It uses the two-pass algorithm for more stable results.
+    Default uses the two-pass algorithm (reference below).
     https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Two-pass_algorithm
-    There exist other implementations that are even more stable, but probably
-    slower.
+    Also supports 'corrected_two_pass' algorithm (using the 'corrected' flag)
+    which is numerically more stable. There exist other implementations that
+    offer better stability, but probably slower.
 
     """
+
+    if isinstance(ddof, (bool)):
+        raise ValueError('Parameter keepdims is now at index 3: (input, \
+                          axis=None, ddof=0, keepdims=False, corrected=False)')
 
     input_ndim = input.type.ndim
     if axis is None:
@@ -3175,37 +3249,67 @@ def var(input, axis=None, keepdims=False):
     centered_input = input - mean_input
 
     # return the mean sqr
-    v = mean((centered_input ** 2), axis, keepdims=keepdims)
+    if ddof == 0:
+        v = mean((centered_input ** 2), axis, keepdims=keepdims)
+    else:
+        shp = shape(input) - ddof
+        v = sum((centered_input ** 2), axis=axis, keepdims=keepdims)
+        for i in axis:
+            v = true_div(v, shp[i])
+
+    # use 'corrected_two_pass' algorithm
+    if corrected:
+        if ddof == 0:
+            error = mean(centered_input, axis, keepdims=keepdims) ** 2
+        else:
+            shp = shape(input) - ddof
+            shp_inp = shape(input)
+            error = sum(centered_input, axis=axis, keepdims=keepdims) ** 2
+            for i in axis:
+                error = true_div(error, shp[i] * shp_inp[i])
+        v = v - error
+
     v.name = 'var'
     return v
 
 
 @constructor
-def std(input, axis=None, keepdims=False):
+def std(input, axis=None, ddof=0, keepdims=False, corrected=False):
     """
     Computes the standard deviation along the given axis(es) of a tensor `input`.
 
     Parameters
     ----------
-    axis : None or int or (list of int) (see `Sum`)
-        Compute the standard deviation along this axis of the tensor.
+    axis: None or int or (list of int) (see `Sum`)
+        Compute the variance along this axis of the tensor.
         None means all axes (like numpy).
+    ddof: Degrees of freedom; 0 would compute the ML estimate, 1 would compute
+        the unbiased estimate.
     keepdims : bool
-        If this is set to True, the axes which are reduced are left in the
-        result as dimensions with size one. With this option, the result will
-        broadcast correctly against the original tensor.
+        If this is set to True, the axes which are reduced are
+        left in the result as dimensions with size one. With this option,
+        the result will broadcast correctly against the original tensor.
+    corrected : bool
+        If this is set to True, the 'corrected_two_pass' algorithm is
+        used to compute the variance.
+        Refer : http://www.cs.yale.edu/publications/techreports/tr222.pdf
 
     Notes
     -----
-    It calls `var()` and `var()` uses the two-pass algorithm for more stable
-    results.
+    It calls 'var()' and 'var()' uses the two-pass algorithm (reference below).
     https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Two-pass_algorithm
-    There exist other implementations that are even more stable, but probably
-    slower.
+    Function 'var()' also supports 'corrected_two_pass' algorithm (using the
+    'corrected' flag) which is numerically more stable. There exist other
+    implementations that offer better stability, but probably slower.
 
     """
 
-    ret = sqrt(var(input=input, axis=axis, keepdims=keepdims))
+    if isinstance(ddof, (bool)):
+        raise ValueError('Parameter keepdims is now at index 3: (input, \
+                          axis=None, ddof=0, keepdims=False, corrected=False)')
+
+    ret = sqrt(var(input=input, axis=axis, ddof=ddof,
+                   keepdims=keepdims, corrected=corrected))
     ret.name = 'std'
     return ret
 
@@ -3417,7 +3521,7 @@ def transpose(x, axes=None):
     """
     if axes is None:
         axes = list(range((x.ndim - 1), -1, -1))
-    ret = DimShuffle(x.broadcastable, axes, inplace=False)(x)
+    ret = DimShuffle(x.broadcastable, axes)(x)
     if x.name and axes == list(range((x.ndim - 1), -1, -1)):
         ret.name = x.name + '.T'
     return ret
@@ -4013,8 +4117,7 @@ class Join(Op):
 
 join = Join()
 
-pprint.assign(lambda pstate, r: r.owner and isinstance(r.owner.op, Join),
-              printing.FunctionPrinter('join'))
+pprint.assign(Join, printing.FunctionPrinter('join'))
 
 
 def roll(x, shift, axis=None):
@@ -4386,7 +4489,7 @@ class Reshape(Op):
 
     def __init__(self, ndim, name=None):
         self.ndim = ndim
-        self.name = name
+        assert name is None, 'name attribute for Reshape has been deprecated'
 
     def __str__(self):
         return '%s{%s}' % (self.__class__.__name__, self.ndim)
@@ -4562,7 +4665,7 @@ class Reshape(Op):
             return Op.c_code(self, node, name, inputs, outputs, sub)
 
 
-def reshape(x, newshape, ndim=None, name=None):
+def reshape(x, newshape, ndim=None):
     if ndim is None:
         newshape = as_tensor_variable(newshape)
         if newshape.ndim != 1:
@@ -4578,7 +4681,7 @@ def reshape(x, newshape, ndim=None, name=None):
                 "to know what the number of dimensions of the reshaped "
                 "variable will be. You can provide the 'ndim' keyword "
                 "argument to 'reshape' to avoid this problem." % newshape)
-    op = Reshape(ndim, name)
+    op = Reshape(ndim)
     rval = op(x, newshape)
     return rval
 
@@ -6260,24 +6363,11 @@ class AllocEmpty(gof.Op):
         assert isinstance(dtype, str), dtype
         self.dtype = dtype.lower()
 
-    def validate_shape(self, shape):
-        sh = [as_tensor_variable(s) for s in shape]
-        bcast = []
-        for s in sh:
-            if s.type.dtype[:3] not in ('int', 'uin'):
-                raise TypeError('Shape arguments must be integers', s)
-            # if s is constant 1, then we're broadcastable in that dim
-            try:
-                const_shp = get_scalar_constant_value(s)
-            except NotScalarConstantError:
-                const_shp = None
-            bcast.append(1 == const_shp)
+    def make_node(self, *shape):
+        shape, bcast = alloc_validate_shape(shape)
         otype = TensorType(dtype=self.dtype, broadcastable=bcast)
         output = otype()
-        return sh, output
 
-    def make_node(self, *shape):
-        shape, output = self.validate_shape(shape)
         output.tag.values_eq_approx = values_eq_approx_always_true
         # The outut can contain nan/inf.  output.type is a new
         # instance, so we can do this only for that variable.

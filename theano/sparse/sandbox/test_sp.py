@@ -20,7 +20,6 @@ from theano.compat import next
 from theano.sparse.sandbox import sp
 from theano.sparse.tests.test_basic import random_lil
 from theano.tests import unittest_tools as utt
-from theano.sparse import verify_grad_sparse
 from theano.sparse.tests.test_basic import sparse_random_inputs
 from theano.tests.unittest_tools import attr
 
@@ -48,7 +47,7 @@ class TestSP(unittest.TestCase):
         filters = rng.randn(nkern, numpy.prod(kshp))
         biasvals = rng.randn(nkern)
 
-        for mode in ('FAST_COMPILE', 'FAST_RUN'):  # , profmode):
+        for mode in ('FAST_COMPILE', 'FAST_RUN'):
             ttot, ntot = 0, 0
             for conv_mode in convmodes:
                 for ss in ssizes:
@@ -129,7 +128,6 @@ class TestSP(unittest.TestCase):
 #            print 'Numpy processing time: ', ntot
 #            print 'Theano processing time: ', ttot
 
-        # profmode.print_summary()
 
     # this doesn't compare the output of anything... but I manually verified that the patches
     # are properly generated

@@ -22,7 +22,6 @@ import theano
 from theano import gof, tensor, scalar, config
 from theano.gradient import DisconnectedType
 from theano.sparse.utils import hash_from_sparse
-import theano.tests.unittest_tools as utt
 from theano.gradient import grad_not_implemented, grad_undefined
 from theano.sparse.type import SparseType, _is_sparse
 
@@ -155,87 +154,6 @@ def as_sparse_or_tensor_variable(x, name=None):
         return as_sparse_variable(x, name)
     except (ValueError, TypeError):
         return theano.tensor.as_tensor_variable(x, name)
-
-
-def verify_grad_sparse(op, pt, structured=False, *args, **kwargs):
-    """
-    Wrapper for theano.test.unittest_tools.py:verify_grad wich
-    converts sparse variables back and forth.
-
-    Parameters
-    ----------
-    op
-        Op to check.
-    pt
-        List of inputs to realize the tests.
-    structured
-        True to tests with a structured grad, False otherwise.
-    args
-        Other `verify_grad` parameters if any.
-    kwargs
-        Other `verify_grad` keywords if any.
-
-    Returns
-    -------
-    None
-
-    """
-
-    def conv_none(x):
-        return x
-
-    def conv_csr(ind, indptr, shp):
-        def f(spdata):
-            return CSR(spdata, ind, indptr, shp)
-        return f
-
-    def conv_csc(ind, indptr, shp):
-        def f(spdata):
-            return CSC(spdata, ind, indptr, shp)
-        return f
-
-    iconv = []
-    dpt = []
-
-    for p in pt:
-        if _is_sparse(p):
-            if structured:
-                dpt.append(p.data)
-            else:
-                dpt.append(p.toarray())
-            if p.format == 'csr':
-                if structured:
-                    iconv.append(conv_csr(p.indices[:p.size], p.indptr,
-                                          p.shape))
-                else:
-                    iconv.append(csr_from_dense)
-            elif p.format == 'csc':
-                if structured:
-                    iconv.append(conv_csc(p.indices[:p.size], p.indptr,
-                                          p.shape))
-                else:
-                    iconv.append(csc_from_dense)
-            else:
-                raise NotImplementedError("No conv for %s" % (p.format,))
-        else:
-            dpt.append(p)
-            iconv.append(conv_none)
-    output = op(*[as_sparse_or_tensor_variable(p) for p in pt])
-    if isinstance(output, (list, tuple)):
-        raise NotImplementedError("verify_grad can't deal with "
-                                  "multiple outputs")
-    if _is_sparse_variable(output):
-        oconv = DenseFromSparse(structured=structured)
-    else:
-        oconv = conv_none
-
-    def conv_op(*inputs):
-        ipt = [conv(i) for i, conv in zip(inputs, iconv)]
-        out = op(*ipt)
-        return oconv(out)
-
-    return utt.verify_grad(conv_op, dpt, *args, **kwargs)
-verify_grad_sparse.E_grad = utt.verify_grad.E_grad
 
 
 def constant(x, name=None):
@@ -1097,7 +1015,7 @@ class GetItemList(gof.op.Op):
     def grad(self, inputs, g_outputs):
         x, indices = inputs
         gout, = g_outputs
-        return [GetItemListGrad(self)(x, indices, gout),
+        return [get_item_list_grad(x, indices, gout),
                 grad_undefined(self, 1, indices, "No gradient for this input")]
 
 get_item_list = GetItemList()
@@ -1192,7 +1110,7 @@ class GetItem2Lists(gof.op.Op):
     def grad(self, inputs, g_outputs):
         x, ind1, ind2 = inputs
         gout, = g_outputs
-        return [GetItem2ListsGrad(self)(x, ind1, ind2, gout),
+        return [get_item_2lists_grad(x, ind1, ind2, gout),
                 grad_undefined(self, 1, ind1, "No gradient for this input"),
                 grad_undefined(self, 1, ind2, "No gradient for this input")]
 

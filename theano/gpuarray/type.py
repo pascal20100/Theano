@@ -22,6 +22,26 @@ except ImportError:
 _context_reg = {}
 
 
+def move_to_gpu(data):
+    """
+    Do we want to move this computation to the GPU?
+
+    Currently, we don't move complex and scalar int.
+
+    Parameters
+    ----------
+    data : numpy.ndarray or TensorVariable
+           (it must have dtype and ndim parameter)
+    """
+    # We don't support complex on the GPU
+    if str(data.dtype) in tensor.basic.complex_dtypes:
+        return False
+    # We don't want scalar int on the GPU.
+    if data.ndim == 0 and str(data.dtype) in tensor.basic.discrete_dtypes:
+        return False
+    return True
+
+
 class ContextNotDefined(ValueError):
     pass
 
@@ -48,6 +68,7 @@ def reg_context(name, ctx):
     if not isinstance(ctx, gpuarray.GpuContext):
         raise TypeError("context is not GpuContext")
     _context_reg[name] = ctx
+    _props_map[ctx] = dict()
 
 
 def get_context(name):
@@ -76,13 +97,33 @@ def list_contexts():
     """
     return _context_reg.keys()
 
+# Mappings of properties to contexts.  Please never use this if you
+# can avoid it.
+
+# This is basically a way to store "global" variables that depend on
+# the context.
+_props_map = {}
+
+
+def _get_props(name):
+    ctx = get_context(name)
+    return _props_map[ctx]
+
+
+def get_prop(name, k):
+    return _get_props(name)[k]
+
+
+def set_prop(name, k, v):
+    _get_props(name)[k] = v
+
 
 # Private method
 def _name_for_ctx(ctx):
     for k, v in iteritems(_context_reg):
         if v == ctx:
             return k
-        raise ContextNotDefined('context is not registered')
+    raise ContextNotDefined('context is not registered')
 
 
 # This is a private method for use by the tests only
@@ -561,15 +602,21 @@ class GpuArraySharedVariable(_operators, SharedVariable):
 
 
 GpuArrayType.SharedVariable = GpuArraySharedVariable
+notset = object()
 
 
 def gpuarray_shared_constructor(value, name=None, strict=False,
                                 allow_downcast=None, borrow=False,
-                                broadcastable=None, target=None):
+                                broadcastable=None, target=notset):
     """
     SharedVariable constructor for GpuArrayType.
 
     See :func:`theano.shared`.
+
+    :target: default None
+        The device target. As None is a valid value and we need to
+        differentiate from the parameter notset and None, we use a
+        notset object.
 
     """
     if target == 'gpu' or target == 'cpu':
@@ -578,6 +625,10 @@ def gpuarray_shared_constructor(value, name=None, strict=False,
     if not isinstance(value, (numpy.ndarray, pygpu.gpuarray.GpuArray)):
         raise TypeError('ndarray or GpuArray required')
 
+    if target is notset:
+        target = None
+        if not move_to_gpu(value):
+            raise TypeError('We do not move that data by default to the GPU')
     try:
         get_context(target)
     except ContextNotDefined:

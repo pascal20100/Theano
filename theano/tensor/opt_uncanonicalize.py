@@ -39,6 +39,7 @@ import logging
 from theano import gof
 from theano.tensor.elemwise import CAReduce
 from theano.tensor import basic as T
+from theano.tensor import DimShuffle
 
 from theano.tensor.basic import (get_scalar_constant_value,
                                  NotScalarConstantError)
@@ -97,4 +98,78 @@ def local_max_to_min(node):
                 return [CAReduce(scal.minimum,
                                  max.owner.op.axis)(neg.owner.inputs[0])]
 
+    return False
+
+
+@register_uncanonicalize
+@gof.local_optimizer([T.Alloc])
+def local_alloc_dimshuffle(node):
+    """
+    If a dimshuffle is inside an alloc and only adds dimension to the
+    left, remove it.
+
+    Alloc(DimShuffle(x), ...) - > Alloc(x, ...)
+    """
+    if isinstance(node.op, T.Alloc):
+        input_ = node.inputs[0]
+        if input_.owner and isinstance(input_.owner.op, DimShuffle):
+            # check if it only adds dimension to the left
+            new_order = input_.owner.op.new_order
+            expected_new_order = ('x',) * (input_.ndim - input_.owner.inputs[0].ndim) + \
+                tuple(range(input_.owner.inputs[0].ndim))
+            if new_order != expected_new_order:
+                return False
+            return [T.alloc(input_.owner.inputs[0], *node.inputs[1:])]
+    return False
+
+
+@register_uncanonicalize
+@gof.local_optimizer([T.Reshape])
+def local_reshape_dimshuffle(node):
+    """
+    If a dimshuffle is inside a reshape and does not change the order
+    of dimensions, remove it.
+
+    Reshape(Dimshuffle(x), shp) -> Reshape(x, shp)
+    """
+    if isinstance(node.op, T.Reshape):
+        input_ = node.inputs[0]
+        if input_.owner and isinstance(input_.owner.op, DimShuffle):
+            new_order = input_.owner.op.new_order
+            offset = 0
+            for dim in new_order:
+                if dim == 'x':
+                    continue
+                elif dim != offset:
+                    return False
+                else:
+                    offset += 1
+            return [T.reshape(input_.owner.inputs[0], node.inputs[1])]
+    return False
+
+
+@register_uncanonicalize
+@gof.local_optimizer([T.DimShuffle])
+def local_dimshuffle_alloc(node):
+    """
+    If an alloc is inside a dimshuffle which only adds dimension to the left,
+    scrap the dimshuffle and adds 1 into the alloc
+
+    dimshuffle{x, 0, 1}(alloc([3 4], 3, 2) => alloc([3 4], 1, 3, 2)
+    """
+    if isinstance(node.op, T.DimShuffle) and node.inputs[0].owner:
+        input_ = node.inputs[0]
+        if isinstance(input_.owner.op, T.Alloc):
+            # check if it only adds dimension to the left
+            new_order = node.op.new_order
+            expected_new_order = ('x',) * (len(new_order) - input_.ndim) + \
+                tuple(range(input_.ndim))
+            if new_order != expected_new_order:
+                return False
+
+            # count numbers of 'x'
+            nb_new_dims = len(new_order) - input_.ndim
+            new_shape_input = (1,) * nb_new_dims + tuple(input_.owner.inputs[1:])
+
+            return [T.alloc(input_.owner.inputs[0], *new_shape_input)]
     return False

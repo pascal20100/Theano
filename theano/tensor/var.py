@@ -1,4 +1,5 @@
 from __future__ import absolute_import, print_function, division
+import collections
 import copy
 import traceback as tb
 import warnings
@@ -466,11 +467,50 @@ class _tensor_py_operators(object):
 
     # SLICING/INDEXING
     def __getitem__(self, args):
+
+        def check_bool(args_el):
+            try:
+                if isinstance(args_el, (numpy.bool_, bool)) or \
+                   args_el.dtype == 'int8' or args_el.dtype == 'uint8':
+                    raise TypeError(('TensorType does not support boolean '
+                                     'mask for indexing such as tensor[x==0]. '
+                                     'Instead you can use non_zeros() such as '
+                                     'tensor[(x == 0).nonzeros()]. '
+                                     'If you are indexing on purpose with an '
+                                     'int8, please cast it to int16.'))
+            except AttributeError:
+                pass
+
+            if not isinstance(args_el, theano.tensor.Variable) and \
+               isinstance(args_el, collections.Iterable):
+                for el in args_el:
+                    check_bool(el)
+
+        check_bool(args)
+
         if (isinstance(args, list) and
                 any([isinstance(a, slice) for a in args])):
             pass
         elif not isinstance(args, tuple):
             args = args,
+
+        # Convert an Ellipsis if provided into an appropriate number of
+        # slice(None).
+        ellipses = [i
+                    for i, index in enumerate(args)
+                    if index is Ellipsis]
+        if len(ellipses) > 1:
+            raise IndexError(
+                "an index can only have a single Ellipsis (`...`)")
+        elif len(ellipses) == 1:
+            new_axes = sum(1
+                           for index in args
+                           if index is numpy.newaxis)  # numpy.newaxis is None
+            ellipsis_at = ellipses[0]
+            args = list(args)
+            args[ellipsis_at: ellipsis_at + 1] = (
+                [slice(None)] * (self.ndim - (len(args) - 1 - new_axes)))
+
         # Convert python literals to theano constants
         args = theano.tensor.subtensor.make_constant(args)
         # Determine if advanced indexing is needed or not
@@ -625,13 +665,15 @@ class _tensor_py_operators(object):
                                         dtype=dtype, keepdims=keepdims,
                                         acc_dtype=acc_dtype)
 
-    def var(self, axis=None, keepdims=False):
+    def var(self, axis=None, ddof=0, keepdims=False, corrected=False):
         """See `theano.tensor.var`."""
-        return theano.tensor.basic.var(self, axis, keepdims=keepdims)
+        return theano.tensor.basic.var(self, axis=axis, ddof=ddof,
+                                       keepdims=keepdims, corrected=corrected)
 
-    def std(self, axis=None, keepdims=False):
+    def std(self, axis=None, ddof=0, keepdims=False, corrected=False):
         """See `theano.tensor.std`."""
-        return theano.tensor.basic.std(self, axis, keepdims=keepdims)
+        return theano.tensor.basic.std(self, axis=axis, ddof=ddof,
+                                       keepdims=keepdims, corrected=corrected)
 
     def min(self, axis=None, keepdims=False):
         """See `theano.tensor.min`."""

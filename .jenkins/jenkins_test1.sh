@@ -1,13 +1,17 @@
 #!/bin/bash
 
-# Script for Jenkins continuous integration testing of theano base and old backend
+# Script for Jenkins continuous integration testing of theano base
 
-echo "===== Testing theano base"
+# Print commands as they are executed
+set -x
 
-# Get environment from worker, necessary for CUDA
-source ~/.bashrc
+# Anaconda python
+export PATH=/usr/local/miniconda2/bin:$PATH
 
-# Test theano CPU and old GPU backend sandbox.cuda
-THEANO_PARAM="theano --with-timer --timer-top-n 10"
-FLAGS="mode=FAST_RUN,init_gpu_device=gpu"
+echo "===== Testing theano core"
+
+# Test theano core
+PARTS="theano -e cuda -e gpuarray"
+THEANO_PARAM="${PARTS} --with-timer --timer-top-n 10 --with-xunit --xunit-file=theanocore_tests.xml"
+FLAGS="mode=FAST_RUN,floatX=float32"
 THEANO_FLAGS=${FLAGS} bin/theano-nose ${THEANO_PARAM}

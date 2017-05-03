@@ -142,12 +142,24 @@ class LogSumExp(Op):
             del oshape[self.axis]
         return [ tuple(oshape) ]
         
-    def grad(self, inp, grads):
+    def gradv1(self, inp, grads):
         x, = inp
         g, = grads
         if not self.keepdims:
             g = T.shape_padaxis(g,self.axis)
         return [g*softmax_with_axis(x,self.axis)]
+
+    def gradv2(self, inp, grads):
+        x, = inp
+        g, = grads
+        if not self.keepdims:
+            g = T.shape_padaxis(g,self.axis)
+        sm = T.exp(x-logsumexp(x,self.axis,keepdims=True))
+        return [g*sm]
+
+
+    def grad(self, inp, grads):
+        return self.gradv2(inp,grads)
 
 def logsumexp(x, axis=-1, keepdims=False):
     if isinstance(x, np.ndarray):
@@ -234,6 +246,30 @@ def local_LogSumExp_optim(node):
 ####  
 ####      ## logsumexp_version
 ####      return logsumexp(T.stack((A,B),axis=-1))
+
+def logaddexp(A,B):
+    if A is None:
+        return B
+    elif B is None:
+        return A
+
+    ## own version using abs
+    # D = T.abs_(A-B)
+    # return (A+B+D)*0.5 + T.log1p(T.exp(-D))
+
+    ## own version using max
+    # max_A_B = T.switch( A>B, A, B)
+    # return max_A_B + T.log(T.exp(A-max_A_B)+T.exp(B-max_A_B))
+
+    ## softplus version
+    return A+softplus(B-A)
+
+    ## logsumexp_reducelast version
+    # return logsumexp_reducelast(T.stack((A,B),axis=-1))
+
+    ## logsumexp_version
+    # return logsumexp(T.stack((A,B),axis=-1))
+
 ####      
 ####  ######## WHAT FOLLOWS ARE UNUSED (CURRENTLY UNREGISTERED) OPTIMIZATIONS ##########
 ####          

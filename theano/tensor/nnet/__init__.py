@@ -17,7 +17,8 @@ from .nnet import (
     graph_merge_softmax_with_crossentropy_softmax, h_softmax,
     logsoftmax, logsoftmax_op, prepend_0_to_each_row, prepend_1_to_each_row,
     prepend_scalar_to_each_row, relu, softmax, softmax_grad, softmax_graph,
-    softmax_op, softmax_simplifier, softmax_with_bias, elu)
+    softmax_op, softmax_simplifier, softmax_with_bias, elu,
+    confusion_matrix)
 from . import opt
 from .conv import ConvOp
 from .Conv3D import *
@@ -31,6 +32,7 @@ from .bn import batch_normalization
 
 import warnings
 from .abstract_conv import conv2d as abstract_conv2d
+from .abstract_conv import conv3d
 
 
 def conv2d(input, filters, input_shape=None, filter_shape=None,
@@ -116,6 +118,9 @@ def conv2d(input, filters, input_shape=None, filter_shape=None,
 
         This is only supported in Theano 0.8 or the development
         version until it is released.
+
+        The parameter filter_dilation is an implementation of `dilated
+        convolution <https://arxiv.org/pdf/1511.07122v3.pdf>`_.
 
     """
 

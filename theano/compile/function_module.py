@@ -1044,7 +1044,6 @@ copyreg.pickle(Function, _pickle_Function)
 ###
 # FunctionMaker
 ###
-
 def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     """
     Insert deepcopy in the fgraph to break aliasing of outputs
@@ -1060,17 +1059,18 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     # memory contract
 
     # We don't insert deep copy when the output.borrow is True for all
-    # conserned outputs.
+    # concerned outputs.
 
     assert len(wrapped_inputs) == len(fgraph.inputs)
     assert len(wrapped_outputs) == len(fgraph.outputs)
     reason = "insert_deepcopy"
-    updated_fgraph_inputs = [fgraph_i for i, fgraph_i in
-                             zip(wrapped_inputs, fgraph.inputs)
-                             if getattr(i, 'update', False)]
+    updated_fgraph_inputs = set([fgraph_i for i, fgraph_i in
+                                zip(wrapped_inputs, fgraph.inputs)
+                                if getattr(i, 'update', False)])
 
     # We can't use fgraph.inputs as this don't include Constant Value.
     all_graph_inputs = gof.graph.inputs(fgraph.outputs)
+    has_destroyers = hasattr(fgraph, 'get_destroyers_of')
 
     for i in xrange(len(fgraph.outputs)):
         views_of_output_i = set()
@@ -1099,12 +1099,9 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
                 #    e.g. in-place computations
                 # b) that j'th input is a shared variable that is also
                 #    being updated
-                if (hasattr(fgraph, 'get_destroyers_of') and
-                        fgraph.get_destroyers_of(input_j)):
-                    continue
                 if input_j in updated_fgraph_inputs:
                     continue
-                if input_j in views_of_output_i:
+                if input_j in views_of_output_i and not (has_destroyers and fgraph.get_destroyers_of(input_j)):
                     # We don't put deep_copy_op if the input and the
                     # output have borrow==True
                     if input_j in fgraph.inputs:
@@ -1381,17 +1378,11 @@ class FunctionMaker(object):
                  output_keys=None):
         mode = theano.compile.mode.get_mode(mode)
 
-        # figure out which profile object to use (if any)
-        # to help with forward-porting ProfileMode,
-        # we allow ProfileMode to provide a ProfileStats object
-        # using this somewhat awkward mechanism.
-        mode_profile = getattr(mode, 'profile', None)
-        if (profile is not None and
-                profile is not False and
-                mode_profile is not None):
+        # Assert old way of working isn't used
+        if getattr(mode, 'profile', None):
             raise TypeError(
-                'profile passed via both "mode" and "profile" arguments')
-        self.profile = profile = profile or mode_profile
+                "profile passed via 'mode'. This isn't supported anymore")
+        self.profile = profile
         if profile:
             # This is very important:
             # 1) We preload the cache here to don't have its timming
@@ -1500,9 +1491,10 @@ class FunctionMaker(object):
                      if not spec.borrow]
         if no_borrow:
             self.linker = linker.accept(
-                fgraph, no_recycling=infer_reuse_pattern(fgraph, no_borrow))
+                fgraph, no_recycling=infer_reuse_pattern(fgraph, no_borrow),
+                profile=profile)
         else:
-            self.linker = linker.accept(fgraph)
+            self.linker = linker.accept(fgraph, profile=profile)
 
         if hasattr(linker, 'accept_var_updates'):
             # hacky thing so VMLinker knows about updates
@@ -1726,8 +1718,8 @@ def orig_function(inputs, outputs, mode=None, accept_inplace=False,
         Default of None means to use `config.mode` (see below for descriptive
         string list).
     name : str
-        An optional name for this fct. If used, the profile mode will print the
-        time spent in this fct.
+        An optional name for this function. If used, the profile mode will print the
+        time spent in this function.
     accept_inplace : bool
         True iff the graph can contain inplace operations prior to the
         optimization phase (default is False).
@@ -1746,9 +1738,6 @@ def orig_function(inputs, outputs, mode=None, accept_inplace=False,
     - FAST_RUN (default) (optimize without too much time)
 
     - FAST_COMPILE (minimal optimization)
-
-    - ProfileMode(deprecated): allow to print a profile mode with
-      mode.print_summary
 
     - DebugMode: verify many internal conditions that are normally assumed
       (slow)

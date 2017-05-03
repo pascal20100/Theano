@@ -1,5 +1,4 @@
 from __future__ import absolute_import, print_function, division
-import string
 
 import numpy as np
 import theano
@@ -49,7 +48,7 @@ class ScikitsCudaOp(GpuOp):
 
         return theano.Apply(self, [inp], [self.output_type(inp)()])
 
-    def make_thunk(self, node, storage_map, _, _2):
+    def make_thunk(self, node, storage_map, _, _2, impl=None):
         if not scikits_cuda_available:
             raise RuntimeError(
                 "scikits.cuda is needed for all GPU fft implementation,"
@@ -62,7 +61,7 @@ class CuFFTOp(ScikitsCudaOp):
         return CudaNdarrayType(
             broadcastable=[False] * (inp.type.ndim + 1))
 
-    def make_thunk(self, node, storage_map, _, _2):
+    def make_thunk(self, node, storage_map, _, _2, impl=None):
         super(CuFFTOp, self).make_thunk(node, storage_map, _, _2)
 
         from theano.misc.pycuda_utils import to_gpuarray
@@ -119,7 +118,7 @@ class CuIFFTOp(ScikitsCudaOp):
         return CudaNdarrayType(
             broadcastable=[False] * (inp.type.ndim - 1))
 
-    def make_thunk(self, node, storage_map, _, _2):
+    def make_thunk(self, node, storage_map, _, _2, impl=None):
         super(CuIFFTOp, self).make_thunk(node, storage_map, _, _2)
 
         from theano.misc.pycuda_utils import to_gpuarray
@@ -247,8 +246,8 @@ def sc_complex_dot_batched(bx_gpu, by_gpu, bc_gpu, transa='N', transb='N',
     alpha = np.complex64(1.0)
     beta = np.complex64(0.0)
 
-    transa = string.lower(transa)
-    transb = string.lower(transb)
+    transa = transa.lower()
+    transb = transb.lower()
 
     if transb in ['t', 'c']:
         N, m, k = by_shape
@@ -315,7 +314,7 @@ class BatchedComplexDotOp(ScikitsCudaOp):
     def output_type(self, inp):
         return CudaNdarrayType(broadcastable=[False] * inp.type.ndim)
 
-    def make_thunk(self, node, storage_map, _, _2):
+    def make_thunk(self, node, storage_map, _, _2, impl=None):
         super(BatchedComplexDotOp, self).make_thunk(node, storage_map, _, _2)
 
         inputs = [storage_map[v] for v in node.inputs]

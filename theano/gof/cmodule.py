@@ -535,14 +535,24 @@ class KeyData(object):
         """
         entry = self.get_entry()
         for key in self.keys:
-            del entry_from_key[key]
+            try:
+                del entry_from_key[key]
+            except KeyError:
+                # This happen if the compiledir was deleted during
+                # this process execution.
+                pass
         if do_manual_check:
             to_del = []
             for key, key_entry in iteritems(entry_from_key):
                 if key_entry == entry:
                     to_del.append(key)
             for key in to_del:
-                del entry_from_key[key]
+                try:
+                    del entry_from_key[key]
+                except KeyError:
+                    # This happen if the compiledir was deleted during
+                    # this process execution.
+                    pass
 
 
 class ModuleCache(object):
@@ -1711,9 +1721,10 @@ class Compiler(object):
 
     """
 
-    @staticmethod
-    def _try_compile_tmp(src_code, tmp_prefix='', flags=(),
-                         try_run=False, output=False, compiler=None):
+    @classmethod
+    def _try_compile_tmp(cls, src_code, tmp_prefix='', flags=(),
+                         try_run=False, output=False, compiler=None,
+                         comp_args=True):
         """
         Try to compile (and run) a test program.
 
@@ -1727,11 +1738,17 @@ class Compiler(object):
         If try_run is True, returns a (compile_status, run_status) pair.
         If output is there, we append the stdout and stderr to the output.
 
+        Compile arguments from the Compiler's compile_args() method are added
+        if comp_args=True.
         """
         if not compiler:
             return False
-
         flags = list(flags)
+        # Get compile arguments from compiler method if required
+        if comp_args:
+            args = cls.compile_args()
+        else:
+            args = []
         compilation_ok = True
         run_ok = False
         out, err = None, None
@@ -1748,7 +1765,7 @@ class Compiler(object):
                 os.close(fd)
                 fd = None
                 out, err, p_ret = output_subprocess_Popen(
-                    [compiler, path, '-o', exe_path] + flags)
+                    [compiler] + args + [path, '-o', exe_path] + flags)
                 if p_ret != 0:
                     compilation_ok = False
                 elif try_run:
@@ -1781,14 +1798,18 @@ class Compiler(object):
         else:
             return (compilation_ok, run_ok, out, err)
 
-    @staticmethod
-    def _try_flags(flag_list, preambule="", body="",
-                   try_run=False, output=False, compiler=None):
+    @classmethod
+    def _try_flags(cls, flag_list, preambule="", body="",
+                   try_run=False, output=False, compiler=None,
+                   comp_args=True):
         """
         Try to compile a dummy file with these flags.
 
         Returns True if compilation was successful, False if there
         were errors.
+
+        Compile arguments from the Compiler's compile_args() method are added
+        if comp_args=True.
 
         """
         if not compiler:
@@ -1802,9 +1823,10 @@ class Compiler(object):
             return 0;
         }
         """ % locals())
-        return Compiler._try_compile_tmp(code, tmp_prefix='try_flags_',
-                                         flags=flag_list, try_run=try_run,
-                                         output=output, compiler=compiler)
+        return cls._try_compile_tmp(code, tmp_prefix='try_flags_',
+                                    flags=flag_list, try_run=try_run,
+                                    output=output, compiler=compiler,
+                                    comp_args=comp_args)
 
 
 def try_march_flag(flags):
@@ -2158,18 +2180,18 @@ class GCC_compiler(Compiler):
 
         return cxxflags
 
-    @staticmethod
-    def try_compile_tmp(src_code, tmp_prefix='', flags=(),
-                        try_run=False, output=False):
-        return Compiler._try_compile_tmp(src_code, tmp_prefix, flags,
-                                         try_run, output,
-                                         theano.config.cxx)
+    @classmethod
+    def try_compile_tmp(cls, src_code, tmp_prefix='', flags=(),
+                        try_run=False, output=False, comp_args=True):
+        return cls._try_compile_tmp(src_code, tmp_prefix, flags,
+                                    try_run, output, theano.config.cxx,
+                                    comp_args)
 
-    @staticmethod
-    def try_flags(flag_list, preambule="", body="",
-                  try_run=False, output=False):
-        return Compiler._try_flags(flag_list, preambule, body, try_run, output,
-                                   theano.config.cxx)
+    @classmethod
+    def try_flags(cls, flag_list, preambule="", body="",
+                  try_run=False, output=False, comp_args=True):
+        return cls._try_flags(flag_list, preambule, body, try_run, output,
+                              theano.config.cxx, comp_args)
 
     @staticmethod
     def compile_str(module_name, src_code, location=None,
@@ -2251,7 +2273,10 @@ class GCC_compiler(Compiler):
             cmd.extend(p for p in preargs if not p.startswith('-O'))
         else:
             cmd.extend(preargs)
-        cmd.extend('-I%s' % idir for idir in include_dirs)
+        # to support path that includes spaces, we need to wrap it with double quotes on Windows
+        path_wrapper = "\"" if os.name == 'nt' else ""
+        cmd.extend(['-I%s%s%s' % (path_wrapper, idir, path_wrapper) for idir in include_dirs])
+        cmd.extend(['-L%s%s%s' % (path_wrapper, ldir, path_wrapper) for ldir in lib_dirs])
         if hide_symbols and sys.platform != 'win32':
             # This has been available since gcc 4.0 so we suppose it
             # is always available. We pass it here since it
@@ -2262,7 +2287,6 @@ class GCC_compiler(Compiler):
             cmd.append('-fvisibility=hidden')
         cmd.extend(['-o', lib_filename])
         cmd.append(cppfilename)
-        cmd.extend(['-L%s' % ldir for ldir in lib_dirs])
         cmd.extend(['-l%s' % l for l in libs])
         # print >> sys.stderr, 'COMPILING W CMD', cmd
         _logger.debug('Running cmd: %s', ' '.join(cmd))

@@ -31,7 +31,6 @@ Operating System :: POSIX
 Operating System :: Unix
 Operating System :: MacOS
 Programming Language :: Python :: 2
-Programming Language :: Python :: 2.6
 Programming Language :: Python :: 2.7
 Programming Language :: Python :: 3
 Programming Language :: Python :: 3.3
@@ -54,7 +53,7 @@ PLATFORMS           = ["Windows", "Linux", "Solaris", "Mac OS-X", "Unix"]
 MAJOR               = 0
 MINOR               = 9
 MICRO               = 0
-SUFFIX              = "dev2"  # Should be blank except for rc's, betas, etc.
+SUFFIX              = "dev3"  # Should be blank except for rc's, betas, etc.
 ISRELEASED          = False
 
 VERSION             = '%d.%d.%d%s' % (MAJOR, MINOR, MICRO, SUFFIX)
@@ -163,7 +162,7 @@ def do_setup():
           platforms=PLATFORMS,
           packages=find_packages(),
           # 1.7.0 give too much warning related to numpy.diagonal.
-          install_requires=['numpy>=1.7.1', 'scipy>=0.11', 'six>=1.9.0'],
+          install_requires=['numpy>=1.9.1', 'scipy>=0.14', 'six>=1.9.0'],
           # pygments is a dependency for Sphinx code highlight
           extras_require={
               'test': ['nose>=1.3.0', 'nose-parameterized>=0.5.0', 'flake8<3'],

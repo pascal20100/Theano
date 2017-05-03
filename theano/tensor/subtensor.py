@@ -20,7 +20,7 @@ from theano.tensor.basic import alloc
 from theano.tensor.basic import (addbroadcast, clip, get_scalar_constant_value,
                                  ARange, TensorType, NotScalarConstantError)
 from theano.tensor.elemwise import DimShuffle
-from theano.tensor.type_other import NoneConst, SliceType, make_slice
+from theano.tensor.type_other import NoneConst, SliceType, NoneTypeT, make_slice
 from theano import config
 
 inplace_increment = None
@@ -398,7 +398,7 @@ class Subtensor(Op):
             raise AdvancedIndexingError(Subtensor.e_indextype, entry)
 
     def get_constant_idx(self, inputs, allow_partial=False,
-                         only_process_constants=False):
+                         only_process_constants=False, elemwise=True):
         """
         Return the idx_list with constant inputs replaced by their
         python scalar equivalent.
@@ -442,7 +442,8 @@ class Subtensor(Op):
                 try:
                     return get_scalar_constant_value(
                         val,
-                        only_process_constants=only_process_constants)
+                        only_process_constants=only_process_constants,
+                        elemwise=elemwise)
                 except theano.tensor.NotScalarConstantError:
                     if allow_partial:
                         return val
@@ -572,11 +573,15 @@ class Subtensor(Op):
         gz, = grads
         x = inputs[0]
         rest = inputs[1:]
-        output = self(*inputs)
-        if output.dtype.find('int') != -1:
+        if x.dtype.find('int') != -1:
             first = x.zeros_like().astype(theano.config.floatX)
         else:
-            first = IncSubtensor(self.idx_list)(x.zeros_like(), gz, *rest)
+            # For best optimization, we let this as an inc.
+            # This allow the opt local_IncSubtensor_serialize to apply first.
+            # We need to implement an optimization that will convert this to a
+            # set subtensor.
+            first = IncSubtensor(self.idx_list)(x.zeros_like(),
+                                                gz, *rest)
         return ([first] + [DisconnectedType()()] * len(rest))
 
     def connection_pattern(self, node):
@@ -1001,8 +1006,7 @@ class SubtensorPrinter:
         else:
             raise TypeError("Can only print Subtensor.")
 
-pprint.assign(lambda pstate, r: r.owner and isinstance(r.owner.op, Subtensor),
-              SubtensorPrinter())
+pprint.assign(Subtensor, SubtensorPrinter())
 
 
 def set_subtensor(x, y, inplace=False,
@@ -2077,6 +2081,8 @@ def as_index_variable(idx):
         return make_slice(idx)
     if isinstance(idx, gof.Variable) and isinstance(idx.type, SliceType):
         return idx
+    if isinstance(idx, gof.Variable) and isinstance(idx.type, NoneTypeT):
+        return idx
     idx = theano.tensor.as_tensor_variable(idx)
     if idx.type.dtype[:3] not in ('int', 'uin'):
         raise TypeError('index must be integers')
@@ -2165,17 +2171,8 @@ class AdvancedSubtensor(Op):
         # TODO: in general, we need to re-pack the inputs into a valid
         # index, just like subtensor
         out[0] = inputs[0].__getitem__(inputs[1:])
-        if (numpy.__version__ <= '1.6.1' and
-                out[0].size != numpy.uint32(out[0].size)):
-            warnings.warn(
-                'Numpy versions 1.6.1 and below have a bug preventing '
-                'advanced indexing from correctly filling arrays that '
-                'are too big (>= 2^32 elements). It is possible that '
-                'out[0] (%s), with shape %s, is not correctly filled.'
-                % (out[0], out[0].shape))
 
     def connection_pattern(self, node):
-
         rval = [[True]]
 
         for ipt in node.inputs[1:]:

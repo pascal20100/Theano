@@ -39,7 +39,7 @@ builtin_int = int
 builtin_float = float
 
 
-class ComplexError(Exception):
+class ComplexError(NotImplementedError):
     """
     Raised if complex numbers are used in an unsupported operation.
 
@@ -2197,7 +2197,7 @@ class Sgn(UnaryScalarOp):
             return '%(z)s = (%(x)s > 0) ? 1. : ((%(x)s < 0) ? -1. : (isnan(%(x)s) ? NAN : 0.));' % locals()
         if type in int_types:
             return "%(z)s = (%(x)s >= 0) ? (%(x)s == 0) ? 0 : 1 : -1;" % locals()
-        raise TypeError()  # complex has no sgn
+        raise ComplexError('complex has no sgn')
 
     def c_code_cache_version(self):
         s = super(Sgn, self).c_code_cache_version()
@@ -2300,7 +2300,7 @@ class RoundHalfToEven(UnaryScalarOp):
         (z,) = outputs
         typ = node.outputs[0].type.dtype
         if typ not in ['float32', 'float64']:
-            Exception("The output should be float32 or float64")
+            raise NotImplementedError("The output should be float32 or float64")
 
         return dedent("""
             #ifndef ROUNDING_EPSILON
@@ -2398,7 +2398,7 @@ class RoundHalfAwayFromZero(UnaryScalarOp):
         if node.outputs[0].type.dtype in ['float32', 'float64']:
             return "%(z)s = round(%(x)s);" % locals()
         else:
-            Exception("The output should be float32 or float64")
+            raise NotImplementedError("The output should be float32 or float64")
 round_half_away_from_zero = RoundHalfAwayFromZero(same_out_float_only)
 
 
@@ -3064,7 +3064,7 @@ arctan = ArcTan(upgrade_to_float, name='arctan')
 
 
 class ArcTan2(BinaryScalarOp):
-    nfunc_spec = ('arctan2', 1, 1)
+    nfunc_spec = ('arctan2', 2, 1)
 
     def impl(self, y, x):
         # If x and y are int8 or uint8, numpy.arctan2 will compute the result
@@ -3462,6 +3462,8 @@ class Composite(ScalarOp):
     init_param = ('inputs', 'outputs')
 
     def __str__(self):
+        if self.name is None:
+            self.init_name()
         return self.name
 
     def make_new_inplace(self, output_types_preference=None, name=None):
@@ -3485,6 +3487,9 @@ class Composite(ScalarOp):
         Return the C code for this Composite Op.
 
         """
+        # It was already called
+        if hasattr(self, '_c_code'):
+            return
         subd = dict(chain(
             ((e, "%%(i%i)s" % i) for i, e in enumerate(self.fgraph.inputs)),
             ((e, "%%(o%i)s" % i) for i, e in enumerate(self.fgraph.outputs))))
@@ -3533,21 +3538,46 @@ class Composite(ScalarOp):
         Return a list of functions that compute each output of self.
 
         """
+        # In the case where the graph is a dag, but not a tree like:
+        # add(*1 -> mul(x, y), *1)
+
+        # We have an efficent way to build the executable (we build
+        # and traverse each node only once).
+
+        # But we don't have an efficient execution. We will execute
+        # like a tree, so nodes that have more then 1 client will be
+        # executed as many times as there number of clients. In the
+        # example aboce, it will calculate *1 twice. Doing otherwise
+        # imply making a complicated execution engine.
+
+        # We need the fast creation of the executor as we always do it
+        # even if we will use the c code. The Python implementation is
+        # already slow, so it is not as much important to have a fast
+        # execution there.
+
+        memo = {}
+
         def compose_impl(r):
-            # this is not optimal at all eg in add(*1 -> mul(x, y), *1)
-            # it will calculate *1 twice
-            # it also doesn't follow fgraph.toposort but that's (presumably)
-            # still correct since we only have scalar ops
+            if r in memo:
+                return memo[r]
             if r in self.fgraph.inputs:
                 idx = self.fgraph.inputs.index(r)
-                return lambda inputs: inputs[idx]
+
+                def f(inputs):
+                    return inputs[idx]
+                memo[r] = f
+                return f
             elif r.owner is None:  # in fgraph.orphans:
-                return lambda inputs: r.data
+                def f(inputs):
+                    return r.data
+                memo[r] = f
+                return f
             node = r.owner
             producers = [compose_impl(input) for input in node.inputs]
 
             def f(inputs):
                 return node.op.impl(*[p(inputs) for p in producers])
+            memo[r] = f
             return f
         self._impls = [compose_impl(r) for r in self.fgraph.outputs]
 
@@ -3556,32 +3586,19 @@ class Composite(ScalarOp):
         Return a readable string representation of self.fgraph.
 
         """
-        try:
-            rval = self.name
-        except AttributeError:
-            if 0:
-                l = []
-                for n in self.fgraph.toposort():
-                    if hasattr(n.op, "name") and n.op.name is not None:
-                        v = n.op.name
-                        if v.startswith("Composite"):
-                            v = v[len("Composite"):]
-                    else:
-                        v = n.op.__class__.__name__
-                    l.append(v)
-                rval = "Composite{" + ",".join(l) + "}"
-            else:
-                for i, r in enumerate(self.fgraph.inputs):
-                    r.name = 'i%i' % i
-                for i, r in enumerate(self.fgraph.outputs):
-                    r.name = 'o%i' % i
-                io = set(self.fgraph.inputs + self.fgraph.outputs)
-                for i, r in enumerate(self.fgraph.variables):
-                    if r not in io and len(r.clients) > 1:
-                        r.name = 't%i' % i
-                rval = "Composite{%s}" % ', '.join([pprint(output) for output
-                                                    in self.fgraph.outputs])
-        self.name = rval
+        rval = self.name
+        if rval is None:
+            for i, r in enumerate(self.fgraph.inputs):
+                r.name = 'i%i' % i
+            for i, r in enumerate(self.fgraph.outputs):
+                r.name = 'o%i' % i
+            io = set(self.fgraph.inputs + self.fgraph.outputs)
+            for i, r in enumerate(self.fgraph.variables):
+                if r not in io and len(r.clients) > 1:
+                    r.name = 't%i' % i
+            rval = "Composite{%s}" % ', '.join([pprint(output) for output
+                                                in self.fgraph.outputs])
+            self.name = rval
 
     def init_fgraph(self):
         # The clone done by FunctionGraph is needed as we don't want
@@ -3642,9 +3659,19 @@ class Composite(ScalarOp):
         self.nin = len(inputs)
         self.nout = len(outputs)
         self.init_fgraph()       # self.fgraph
-        self.init_name()      # self.name
-        self.init_c_code()    # self._c_code and self.nodenames
-        self.init_py_impls()  # self._impls
+
+        # Postpone the creation in case it isn't needed.
+        #  self.init_name()      # self.name
+        self.name = None
+        self.prepare_node_called = set()
+
+    def prepare_node(self, node, storage_map, compute_map, impl):
+        if impl == 'py':
+            self.init_py_impls()  # self._impls
+        if impl not in self.prepare_node_called:
+            for n in theano.gof.graph.list_of_nodes(self.inputs, self.outputs):
+                n.op.prepare_node(n, None, None, impl)
+            self.prepare_node_called.add(impl)
 
     def output_types(self, input_types):
         if tuple(input_types) != self.inputs_type:
@@ -3688,6 +3715,8 @@ class Composite(ScalarOp):
         raise NotImplementedError("grad is not implemented for Composite")
 
     def c_code(self, node, nodename, inames, onames, sub):
+        self.init_c_code()
+
         d = dict(chain(izip(("i%i" % i for i in xrange(len(inames))), inames),
                        izip(("o%i" % i for i in xrange(len(onames))),
                             onames)), **sub)
@@ -3720,6 +3749,7 @@ class Composite(ScalarOp):
         return "\n".join(sorted(set(rval)))
 
     def c_support_code_apply(self, node, name):
+        self.init_c_code()
         rval = []
         for subnode, subnodename in zip(self.fgraph.toposort(), self.nodenames):
             try:
@@ -3745,9 +3775,11 @@ class Composite(ScalarOp):
             return False
         # see __hash__ for comment on why there is no mention of fgraph
         # or module cache key here.
+        self.init_c_code()    # self._c_code and self.nodenames
         return (self._c_code == other._c_code)
 
     def __hash__(self):
+        self.init_c_code()    # self._c_code and self.nodenames
         rval = hash((type(self),
                     self.nin,
                     self.nout,
@@ -3764,7 +3796,7 @@ class Composite(ScalarOp):
 
     def __getstate__(self):
         rval = dict(self.__dict__)
-        del rval['_impls']
+        rval.pop('_impls', None)
         del rval['fgraph']
         return rval
 

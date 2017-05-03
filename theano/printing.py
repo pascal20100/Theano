@@ -20,7 +20,6 @@ from theano import gof
 from theano import config
 from theano.gof import Op, Apply
 from theano.compile import Function, debugmode, SharedVariable
-from theano.compile.profilemode import ProfileMode
 
 pydot_imported = False
 pydot_imported_msg = ""
@@ -30,7 +29,7 @@ try:
     if pd.find_graphviz():
         pydot_imported = True
     else:
-        pydot_imported_msg = "pydot-ng can't find graphviz"
+        pydot_imported_msg = "pydot-ng can't find graphviz. Install graphviz."
 except ImportError:
     try:
         # fall back on pydot if necessary
@@ -45,7 +44,11 @@ except ImportError:
             pydot_imported = True
     except ImportError:
         # tests should not fail on optional dependency
-        pydot_imported_msg = "Install the python package pydot or pydot-ng."
+        pydot_imported_msg = ("Install the python package pydot or pydot-ng."
+                              " Install graphviz.")
+    except Exception as e:
+        pydot_imported_msg = "An error happened while importing/trying pydot: "
+        pydot_imported_msg += str(e.args)
 
 
 _logger = logging.getLogger("theano.printing")
@@ -336,16 +339,16 @@ class PrinterState(gof.utils.scratchpad):
     def __init__(self, props=None, **more_props):
         if props is None:
             props = {}
-        if isinstance(props, gof.utils.scratchpad):
+        elif isinstance(props, gof.utils.scratchpad):
             self.__update__(props)
         else:
             self.__dict__.update(props)
         self.__dict__.update(more_props)
-
-    def clone(self, props=None, **more_props):
-        if props is None:
-            props = {}
-        return PrinterState(self, **dict(props, **more_props))
+        # A dict from the object to print to its string
+        # representation. If it is a dag and not a tree, it allow to
+        # parse each node of the graph only once. They will still be
+        # printed many times
+        self.memo = {}
 
 
 class OperatorPrinter:
@@ -357,6 +360,8 @@ class OperatorPrinter:
         assert self.assoc in VALID_ASSOC
 
     def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
         pprinter = pstate.pprinter
         node = output.owner
         if node is None:
@@ -376,22 +381,27 @@ class OperatorPrinter:
         input_strings = []
         max_i = len(node.inputs) - 1
         for i, input in enumerate(node.inputs):
+            new_precedence = self.precedence
             if (self.assoc == 'left' and i != 0 or self.assoc == 'right' and
                     i != max_i):
-                s = pprinter.process(input, pstate.clone(
-                    precedence=self.precedence + 1e-6))
-            else:
-                s = pprinter.process(input, pstate.clone(
-                    precedence=self.precedence))
+                new_precedence += 1e-6
+            try:
+                old_precedence = getattr(pstate, 'precedence', None)
+                pstate.precedence = new_precedence
+                s = pprinter.process(input, pstate)
+            finally:
+                pstate.precedence = old_precedence
             input_strings.append(s)
         if len(input_strings) == 1:
             s = self.operator + input_strings[0]
         else:
             s = (" %s " % self.operator).join(input_strings)
         if parenthesize:
-            return "(%s)" % s
+            r = "(%s)" % s
         else:
-            return s
+            r = s
+        pstate.memo[output] = r
+        return r
 
 
 class PatternPrinter:
@@ -405,6 +415,8 @@ class PatternPrinter:
                 self.patterns.append((pattern[0], pattern[1:]))
 
     def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
         pprinter = pstate.pprinter
         node = output.owner
         if node is None:
@@ -414,14 +426,23 @@ class PatternPrinter:
         pattern, precedences = self.patterns[idx]
         precedences += (1000,) * len(node.inputs)
 
-        def pp_process(input, precedence):
-            return pprinter.process(input, pstate.clone(precedence=precedence))
+        def pp_process(input, new_precedence):
+            try:
+                old_precedence = getattr(pstate, 'precedence', None)
+                pstate.precedence = new_precedence
+                r = pprinter.process(input, pstate)
+            finally:
+                pstate.precedence = old_precedence
+
+            return r
 
         d = dict((str(i), x)
                  for i, x in enumerate(pp_process(input, precedence)
                                        for input, precedence in
                                        zip(node.inputs, precedences)))
-        return pattern % d
+        r = pattern % d
+        pstate.memo[output] = r
+        return r
 
 
 class FunctionPrinter:
@@ -430,6 +451,8 @@ class FunctionPrinter:
         self.names = names
 
     def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
         pprinter = pstate.pprinter
         node = output.owner
         if node is None:
@@ -437,74 +460,81 @@ class FunctionPrinter:
                             "not the result of an operation" % self.names)
         idx = node.outputs.index(output)
         name = self.names[idx]
-        return "%s(%s)" % (name, ", ".join(
-            [pprinter.process(input, pstate.clone(precedence=-1000))
-             for input in node.inputs]))
+        new_precedence = -1000
+        try:
+            old_precedence = getattr(pstate, 'precedence', None)
+            pstate.precedence = new_precedence
+            r = "%s(%s)" % (name, ", ".join(
+                [pprinter.process(input, pstate) for input in node.inputs]))
+        finally:
+            pstate.precedence = old_precedence
 
-
-class MemberPrinter:
-
-    def __init__(self, *names):
-        self.names = names
-
-    def process(self, output, pstate):
-        pprinter = pstate.pprinter
-        node = output.owner
-        if node is None:
-            raise TypeError("function %s cannot represent a variable that is"
-                            " not the result of an operation" % self.function)
-        idx = node.outputs.index(output)
-        name = self.names[idx]
-        input = node.inputs[0]
-        return "%s.%s" % (pprinter.process(input,
-                                           pstate.clone(precedence=1000)),
-                          name)
+        pstate.memo[output] = r
+        return r
 
 
 class IgnorePrinter:
 
     def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
         pprinter = pstate.pprinter
         node = output.owner
         if node is None:
             raise TypeError("function %s cannot represent a variable that is"
                             " not the result of an operation" % self.function)
         input = node.inputs[0]
-        return "%s" % pprinter.process(input, pstate)
-
-
-class DefaultPrinter:
-
-    def __init__(self):
-        pass
-
-    def process(self, r, pstate):
-        pprinter = pstate.pprinter
-        node = r.owner
-        if node is None:
-            return LeafPrinter().process(r, pstate)
-        return "%s(%s)" % (str(node.op), ", ".join(
-            [pprinter.process(input, pstate.clone(precedence=-1000))
-             for input in node.inputs]))
+        r = "%s" % pprinter.process(input, pstate)
+        pstate.memo[output] = r
+        return r
 
 
 class LeafPrinter:
-    def process(self, r, pstate):
-        if r.name in greek:
-            return greek[r.name]
+    def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
+        if output.name in greek:
+            r = greek[output.name]
         else:
-            return str(r)
+            r = str(output)
+        pstate.memo[output] = r
+        return r
+leaf_printer = LeafPrinter()
+
+
+class DefaultPrinter:
+    def process(self, output, pstate):
+        if output in pstate.memo:
+            return pstate.memo[output]
+        pprinter = pstate.pprinter
+        node = output.owner
+        if node is None:
+            return leaf_printer.process(output, pstate)
+        new_precedence = -1000
+        try:
+            old_precedence = getattr(pstate, 'precedence', None)
+            pstate.precedence = new_precedence
+            r = "%s(%s)" % (str(node.op), ", ".join(
+                [pprinter.process(input, pstate)
+                 for input in node.inputs]))
+        finally:
+            pstate.precedence = old_precedence
+
+        pstate.memo[output] = r
+        return r
+default_printer = DefaultPrinter()
 
 
 class PPrinter:
     def __init__(self):
         self.printers = []
+        self.printers_dict = {}
 
     def assign(self, condition, printer):
-        if isinstance(condition, gof.Op):
-            op = condition
-            condition = (lambda pstate, r: r.owner is not None and
-                         r.owner.op == op)
+        # condition can be a class or an instance of an Op.
+        if isinstance(condition, (gof.Op, type)):
+            self.printers_dict[condition] = printer
+            return
         self.printers.insert(0, (condition, printer))
 
     def process(self, r, pstate=None):
@@ -512,6 +542,11 @@ class PPrinter:
             pstate = PrinterState(pprinter=self)
         elif isinstance(pstate, dict):
             pstate = PrinterState(pprinter=self, **pstate)
+        if getattr(r, 'owner', None) is not None:
+            if r.owner.op in self.printers_dict:
+                return self.printers_dict[r.owner.op].process(r, pstate)
+            if type(r.owner.op) in self.printers_dict:
+                return self.printers_dict[type(r.owner.op)].process(r, pstate)
         for condition, printer in self.printers:
             if condition(pstate, r):
                 return printer.process(r, pstate)
@@ -519,6 +554,7 @@ class PPrinter:
     def clone(self):
         cp = copy(self)
         cp.printers = list(self.printers)
+        cp.printers_dict = dict(self.printers_dict)
         return cp
 
     def clone_assign(self, condition, printer):
@@ -541,7 +577,7 @@ class PPrinter:
         else:
             strings = []
         pprinter = self.clone_assign(lambda pstate, r: r.name is not None and
-                                     r is not current, LeafPrinter())
+                                     r is not current, leaf_printer)
         inv_updates = dict((b, a) for (a, b) in iteritems(updates))
         i = 1
         for node in gof.graph.io_toposort(list(inputs) + updates.keys(),
@@ -610,10 +646,7 @@ else:
 
 
 pprint = PPrinter()
-pprint.assign(lambda pstate, r: True, DefaultPrinter())
-pprint.assign(lambda pstate, r: hasattr(pstate, 'target') and
-              pstate.target is not r and r.name is not None,
-              LeafPrinter())
+pprint.assign(lambda pstate, r: True, default_printer)
 
 pp = pprint
 """
@@ -725,15 +758,10 @@ def pydotprint(fct, outfile=None,
                                config.device + '.' + format)
 
     if isinstance(fct, Function):
-        mode = fct.maker.mode
         profile = getattr(fct, "profile", None)
-        if (not isinstance(mode, ProfileMode) or
-                fct not in mode.profile_stats):
-                mode = None
         outputs = fct.maker.fgraph.outputs
         topo = fct.maker.fgraph.toposort()
     elif isinstance(fct, gof.FunctionGraph):
-        mode = None
         profile = None
         outputs = fct.outputs
         topo = fct.toposort()
@@ -746,7 +774,6 @@ def pydotprint(fct, outfile=None,
         assert all(isinstance(v, gof.Variable) for v in fct)
         fct = gof.FunctionGraph(inputs=gof.graph.inputs(fct),
                                 outputs=fct)
-        mode = None
         profile = None
         outputs = fct.outputs
         topo = fct.toposort()
@@ -834,19 +861,7 @@ def pydotprint(fct, outfile=None,
         if node in apply_name_cache:
             return apply_name_cache[node], apply_name_id[node]
         prof_str = ''
-        if mode:
-            time = mode.profile_stats[fct].apply_time.get(node, 0)
-            # second, % total time in profiler, %fct time in profiler
-            if mode.local_time == 0:
-                pt = 0
-            else:
-                pt = time * 100 / mode.local_time
-            if mode.profile_stats[fct].fct_callcount == 0:
-                pf = 0
-            else:
-                pf = time * 100 / mode.profile_stats[fct].fct_call_time
-            prof_str = '   (%.3fs,%.3f%%,%.3f%%)' % (time, pt, pf)
-        elif profile:
+        if profile:
             time = profile.apply_time.get(node, 0)
             # second, %fct time in profiler
             if profile.fct_callcount == 0:

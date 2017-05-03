@@ -77,7 +77,7 @@ in the input).
 
 Here is an example of a discrete convolution:
 
-.. figure:: conv_arithmetic_figures/numerical_no_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/numerical_no_padding_no_strides.*
     :figclass: align-center
 
 The light blue grid is called the *input feature map*. A *kernel* (shaded area)
@@ -93,8 +93,8 @@ of value
 
 slides across the input feature map. At each location, the product between each
 element of the kernel and the input element it overlaps is computed and the
-results are summed up to obtain the output in the current location. The final 
-output of this procedure is a matrix called *output feature map* (in green). 
+results are summed up to obtain the output in the current location. The final
+output of this procedure is a matrix called *output feature map* (in green).
 
 This procedure can be repeated using different kernels to form as many output
 feature maps (a.k.a. *output channels*) as desired. Note also that to keep the
@@ -114,7 +114,7 @@ If there are multiple input and output feature maps, the collection of kernels
 form a 4D array (``output_channels, input_channels, filter_rows,
 filter_columns``). For each output channel, each input channel is convolved with
 a distinct part of the kernel and the resulting set of feature maps is summed
-elementwise to produce the corresponding output feature map. The result of this 
+elementwise to produce the corresponding output feature map. The result of this
 procedure is a set of output feature maps, one for each output channel, that is
 the output of the convolution.
 
@@ -149,7 +149,7 @@ For instance, here is a :math:`3 \times 3` kernel applied to a
 :math:`5 \times 5` input padded with a :math:`1 \times 1` border of zeros using
 :math:`2 \times 2` strides:
 
-.. figure:: conv_arithmetic_figures/numerical_padding_strides.gif
+.. figure:: conv_arithmetic_figures/numerical_padding_strides.*
     :figclass: align-center
 
 The analysis of the relationship between convolutional layer properties is eased
@@ -206,7 +206,7 @@ The simplest case to analyze is when the kernel just slides across every
 position of the input (i.e., :math:`s = 1` and :math:`p = 0`).
 Here is an example for :math:`i = 4` and :math:`k = 3`:
 
-.. figure:: conv_arithmetic_figures/no_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/no_padding_no_strides.*
     :figclass: align-center
 
 One way of defining the output size in this case is by the number of possible
@@ -265,7 +265,7 @@ relationship:
 
 Here is an example for :math:`i = 5`, :math:`k = 4` and :math:`p = 2`:
 
-.. figure:: conv_arithmetic_figures/arbitrary_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/arbitrary_padding_no_strides.*
     :figclass: align-center
 
 Special cases
@@ -305,7 +305,7 @@ be a desirable property:
 This is sometimes referred to as *half* (or *same*) padding. Here is an example
 for :math:`i = 5`, :math:`k = 3` and (therefore) :math:`p = 1`:
 
-.. figure:: conv_arithmetic_figures/same_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/same_padding_no_strides.*
     :figclass: align-center
 
 Note that half padding also works for even-valued :math:`k` and for :math:`s >
@@ -347,7 +347,7 @@ possible partial or complete superimposition of the kernel on the input feature
 map is taken into account. Here is an example for :math:`i = 5`, :math:`k = 3`
 and (therefore) :math:`p = 2`:
 
-.. figure:: conv_arithmetic_figures/full_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/full_padding_no_strides.*
     :figclass: align-center
 
 No zero padding, non-unit strides
@@ -359,7 +359,7 @@ the analysis, let's momentarily ignore zero padding (i.e., :math:`s > 1` and
 :math:`p = 0`). Here is an example for :math:`i = 5`, :math:`k = 3` and :math:`s
 = 2`:
 
-.. figure:: conv_arithmetic_figures/no_padding_strides.gif
+.. figure:: conv_arithmetic_figures/no_padding_strides.*
     :figclass: align-center
 
 Once again, the output size can be defined in terms of the number of possible
@@ -428,13 +428,13 @@ that this ambiguity applies only for :math:`s > 1`.
 Here is an example for :math:`i = 5`, :math:`k = 3`, :math:`s = 2` and :math:`p
 = 1`:
 
-.. figure:: conv_arithmetic_figures/padding_strides.gif
+.. figure:: conv_arithmetic_figures/padding_strides.*
     :figclass: align-center
 
 Here is an example for :math:`i = 6`, :math:`k = 3`, :math:`s = 2` and :math:`p
 = 1`:
 
-.. figure:: conv_arithmetic_figures/padding_strides_odd.gif
+.. figure:: conv_arithmetic_figures/padding_strides_odd.*
     :figclass: align-center
 
 Interestingly, despite having different input sizes these convolutions share the
@@ -478,7 +478,7 @@ Convolution as a matrix operation
 Take for example the convolution presented in the *No zero padding, unit
 strides* subsection:
 
-.. figure:: conv_arithmetic_figures/no_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/no_padding_no_strides.*
     :figclass: align-center
 
 If the input and output were to be unrolled into vectors from left to right, top
@@ -572,7 +572,7 @@ Let's consider the convolution of a :math:`3 \times 3` kernel on a :math:`4
 :math:`k = 3`, :math:`s = 1` and :math:`p = 0`). As depicted in the convolution
 below, this produces a :math:`2 \times 2` output:
 
-.. figure:: conv_arithmetic_figures/no_padding_no_strides.gif
+.. figure:: conv_arithmetic_figures/no_padding_no_strides.*
     :figclass: align-center
 
 The transpose of this convolution will then have an output of shape :math:`4
@@ -585,7 +585,7 @@ a :math:`2 \times 2` input padded with a :math:`2 \times 2` border of zeros
 using unit strides (i.e., :math:`i' = 2`, :math:`k' = k`, :math:`s' = 1` and
 :math:`p' = 2`), as shown here:
 
-.. figure:: conv_arithmetic_figures/no_padding_no_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/no_padding_no_strides_transposed.*
     :figclass: align-center
 
 Notably, the kernel's and stride's sizes remain the same, but the input of the
@@ -627,7 +627,7 @@ for the other elements of the image, giving rise to the following relationship:
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, filter_shape=(c1, c2, k1, k2), border_mode=(0, 0),
             subsample=(1, 1))
         # input.shape[2] == output.shape[2] + (k1 - 1)
@@ -646,7 +646,7 @@ padded with *less* zeros.
 It is indeed the case, as shown in here for :math:`i = 5`, :math:`k = 4` and
 :math:`p = 2`:
 
-.. figure:: conv_arithmetic_figures/arbitrary_padding_no_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/arbitrary_padding_no_strides_transposed.*
     :figclass: align-center
 
 Formally, the following relationship applies for zero padded convolutions:
@@ -667,7 +667,7 @@ Formally, the following relationship applies for zero padded convolutions:
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, filter_shape=(c1, c2, k1, k2), border_mode=(p1, p2),
             subsample=(1, 1))
         # input.shape[2] == output.shape[2] + (k1 - 1) - 2 * p1
@@ -704,7 +704,7 @@ applies:
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, filter_shape=(c1, c2, k1, k2), border_mode='half',
             subsample=(1, 1))
         # input.shape[2] == output.shape[2]
@@ -713,7 +713,7 @@ applies:
 Here is an example for :math:`i = 5`, :math:`k = 3` and (therefore) :math:`p =
 1`:
 
-.. figure:: conv_arithmetic_figures/same_padding_no_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/same_padding_no_strides_transposed.*
     :figclass: align-center
 
 Full padding, transposed
@@ -740,7 +740,7 @@ the transpose of a fully padded convolution is a non-padded convolution:
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, filter_shape=(c1, c2, k1, k2), border_mode='full',
             subsample=(1, 1))
         # input.shape[2] == output.shape[2] - (k1 - 1)
@@ -749,7 +749,7 @@ the transpose of a fully padded convolution is a non-padded convolution:
 Here is an example for :math:`i = 5`, :math:`k = 3` and (therefore) :math:`p =
 2`:
 
-.. figure:: conv_arithmetic_figures/full_padding_no_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/full_padding_no_strides_transposed.*
     :figclass: align-center
 
 No zero padding, non-unit strides, transposed
@@ -763,7 +763,7 @@ intuition, which is why transposed convolutions are sometimes called
 
 Here is an example for :math:`i = 5`, :math:`k = 3` and :math:`s = 2`:
 
-.. figure:: conv_arithmetic_figures/no_padding_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/no_padding_strides_transposed.*
     :figclass: align-center
 
 This should help understand what fractional strides involve: zeros
@@ -799,7 +799,7 @@ of :math:`s`. In that case, the following relationship holds:
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, filter_shape=(c1, c2, k1, k2), border_mode=(0, 0),
             subsample=(s1, s2))
         # input.shape[2] == s1 * (output.shape[2] - 1) + k1
@@ -832,7 +832,7 @@ combining :ref:`Relationship 8 <Relationship8>` and
 
         o_prime1 = s1 * (output.shape[2] - 1) + k1 - 2 * p1
         o_prime2 = s2 * (output.shape[3] - 1) + k2 - 2 * p2
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, input_shape=(b, c1, o_prime1, o_prime2),
             filter_shape=(c1, c2, k1, k2), border_mode=(p1, p2),
             subsample=(s1, s2))
@@ -840,7 +840,7 @@ combining :ref:`Relationship 8 <Relationship8>` and
 Here is an example for :math:`i = 5`, :math:`k = 3`, :math:`s = 2` and :math:`p
 = 1`:
 
-.. figure:: conv_arithmetic_figures/padding_strides_transposed.gif
+.. figure:: conv_arithmetic_figures/padding_strides_transposed.*
     :figclass: align-center
 
 The constraint on the size of the input :math:`i` can be relaxed by introducing
@@ -867,7 +867,7 @@ between the :math:`s` different cases that all lead to the same :math:`i'`:
 
         o_prime1 = s1 * (output.shape[2] - 1) + a1 + k1 - 2 * p1
         o_prime2 = s2 * (output.shape[3] - 1) + a2 + k2 - 2 * p2
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, input_shape=(b, c1, o_prime1, o_prime2),
             filter_shape=(c1, c2, k1, k2), border_mode=(p1, p2),
             subsample=(s1, s2))
@@ -875,7 +875,7 @@ between the :math:`s` different cases that all lead to the same :math:`i'`:
 Here is an example for :math:`i = 6`, :math:`k = 3`, :math:`s = 2` and :math:`p
 = 1`:
 
-.. figure:: conv_arithmetic_figures/padding_strides_odd_transposed.gif
+.. figure:: conv_arithmetic_figures/padding_strides_odd_transposed.*
     :figclass: align-center
 
 .. [#] Dumoulin, Vincent, and Visin, Francesco. "A guide to convolution
@@ -934,6 +934,6 @@ Quick reference
 
     .. code-block:: python
 
-        input = theano.tensor.nnet.conv2d_grad_wrt_inputs(
+        input = theano.tensor.nnet.abstract_conv.conv2d_grad_wrt_inputs(
             output, filters, input_shape=(9, 9), filter_shape=(c1, c2, 4, 4),
             border_mode='valid', subsample=(2, 2))

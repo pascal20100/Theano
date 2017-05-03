@@ -539,6 +539,8 @@ def makeTester(name, op, expected, checks=None, good=None, bad_build=None,
                     assert None not in in_grad_vars
 
     Checker.__name__ = name
+    if hasattr(Checker, '__qualname__'):
+        Checker.__qualname__ = name
     return Checker
 
 
@@ -559,7 +561,7 @@ def rand_nonzero(shape, eps=3e-4):
 
 
 def randint(*shape):
-    return numpy.random.random_integers(-5, 5, shape)
+    return numpy.random.randint(-5, 6, shape)
 
 def randuint(*shape):
     return numpy.array(numpy.random.randint(5, size=shape), dtype=numpy.uint32)
@@ -575,7 +577,7 @@ def randcomplex_nonzero(shape, eps=1e-4):
 
 
 def randint_nonzero(*shape):
-    r = numpy.random.random_integers(-5, 4, shape)
+    r = numpy.random.randint(-5, 5, shape)
     return r + (r == 0) * 5
 
 
@@ -585,7 +587,7 @@ def rand_ranged(min, max, shape):
 
 
 def randint_ranged(min, max, shape):
-    return numpy.random.random_integers(min, max, shape)
+    return numpy.random.randint(min, max+1, shape)
 
 
 def randc128_ranged(min, max, shape):
@@ -1647,7 +1649,7 @@ TanhInplaceTester = makeBroadcastTester(
     grad=_grad_broadcast_unary_normal,
     inplace=True)
 
-_eps = 1e-10
+_eps = 1e-2
 _good_broadcast_unary_arctanh = dict(
     normal=(rand_ranged(-1 + _eps, 1 - _eps, (2, 3)),),
     integers=(randint_ranged(-1 + _eps, 1 - _eps, (2, 3)),),
@@ -3081,6 +3083,15 @@ class T_max_and_argmax(unittest.TestCase):
         v = eval_outputs(max_and_argmax(x, [1, -1])[0].shape)
         assert tuple(v) == numpy.max(data, (1, -1)).shape
 
+    def test_zero_shape(self):
+        x = tensor.matrix()
+        m, i = max_and_argmax(x, axis=1)
+        f = theano.function([x], [m, i])
+        xv = numpy.zeros((0, 4), dtype=floatX)
+        mv, iv = f(xv)
+        assert mv.shape == (0,)
+        assert iv.shape == (0,)
+
 
 class T_argmin_argmax(unittest.TestCase):
     def setUp(self):
@@ -3609,16 +3620,16 @@ class T_Join_and_Split(unittest.TestCase):
         f = function([a, b], s, mode=self.mode)
         v = numpy.zeros((2, 3, 2))
         v[:,:,0] = v1
-        v[:,:,1] = v2 
-        out = f(v1, v2) 
+        v[:,:,1] = v2
+        out = f(v1, v2)
         self.assertTrue(v.shape == out.shape)
         self.assertTrue(numpy.all(v == out))
         s = stack([a, b], axis=-2)
         f = function([a, b], s, mode=self.mode)
         v = numpy.zeros((2, 2, 3))
         v[:,0,:] = v1
-        v[:,1,:] = v2 
-        out = f(v1, v2) 
+        v[:,1,:] = v2
+        out = f(v1, v2)
         self.assertTrue(v.shape == out.shape)
         self.assertTrue(numpy.all(v == out))
         # Testing out-of-bounds axis
@@ -4994,7 +5005,7 @@ class T_scalarfromtensor(unittest.TestCase):
 
         self.assertTrue(v == 56, v)
         if config.cast_policy == 'custom':
-            self.assertTrue(isinstance(v, numpy.int8))
+            self.assertTrue(isinstance(v, numpy.int16))
         elif config.cast_policy in ('numpy', 'numpy+floatX'):
             self.assertTrue(isinstance(
                 v, getattr(numpy, str(numpy.asarray(56).dtype))))
@@ -5130,14 +5141,18 @@ class T_reshape(utt.InferShapeTester, utt.TestOptimizationMixin):
         self.ignore_topo = ignore_topo
         super(T_reshape, self).__init__(name)
 
-    def function(self, inputs, outputs):
+    def function(self, inputs, outputs, ignore_empty=False):
         f = function(inputs, outputs, mode=self.mode)
         if self.mode is not None or theano.config.mode != "FAST_COMPILE":
             topo = f.maker.fgraph.toposort()
             topo_ = [node for node in topo if not isinstance(node.op,
                                                              self.ignore_topo)]
-            assert len(topo_) == 1, topo_
-            assert type(topo_[0].op) is self.op
+            if ignore_empty:
+                assert len(topo_) <= 1, topo_
+            else:
+                assert len(topo_) == 1, topo_
+            if len(topo_) > 0:
+                assert type(topo_[0].op) is self.op
         return f
 
     def test_reshape(self):
@@ -5210,10 +5225,21 @@ class T_reshape(utt.InferShapeTester, utt.TestOptimizationMixin):
 
         # test broadcast flag for constant value of 1
         c = reshape(b, (b.shape[0], b.shape[1], 1))
-        f = self.function([b], c)
+        # That reshape may get replaced with a dimshuffle, with is ignored,
+        # so we pass "ignore_empty=True"
+        f = self.function([b], c, ignore_empty=True)
         assert numpy.all(f(numpy.asarray([[0, 1, 2], [3, 4, 5]])) ==
                          numpy.asarray([[[0], [1], [2]], [[3], [4], [5]]]))
-        assert (f.maker.fgraph.toposort()[-2].outputs[0].type.broadcastable ==
+        assert (f.maker.fgraph.toposort()[-1].outputs[0].type.broadcastable ==
+                (False, False, True))
+
+        # test broadcast flag for constant value of 1 if it cannot be
+        # replaced with dimshuffle
+        c = reshape(b, (b.shape[1], b.shape[0], 1))
+        f = self.function([b], c, ignore_empty=True)
+        assert numpy.all(f(numpy.asarray([[0, 1, 2], [3, 4, 5]])) ==
+                         numpy.asarray([[[0], [1]], [[2], [3]], [[4], [5]]]))
+        assert (f.maker.fgraph.toposort()[-1].outputs[0].type.broadcastable ==
                 (False, False, True))
 
     def test_m1(self):
@@ -5453,7 +5479,7 @@ def test_tile():
     # Test 1,2,3,4-dimensional cases.
     # Test input x has the shape [2], [2, 4], [2, 4, 3], [2, 4, 3, 5].
     test_shape = [2, 4, 3, 5]
-    k = 0 
+    k = 0
     for xtype in [vector(), matrix(), tensor3(), tensor4()]:
         x = xtype
         k = k+1
@@ -5511,7 +5537,7 @@ def test_tile():
             reps_ = r[:k-1]
             f = function([x], tile(x, reps_, ndim_))
             assert numpy.all( f(x_) == numpy.tile(x_, [1, 1] + reps_))
-           
+
         # error raising test: ndim not specified when reps is vector
         reps = ivector()
         numpy.testing.assert_raises(ValueError, tile, x, reps)
@@ -5519,7 +5545,7 @@ def test_tile():
         # error raising test: not a integer
         for reps in [2.5, fscalar(), fvector()]:
             numpy.testing.assert_raises(ValueError, tile, x, reps)
-        
+
         # error raising test: the dimension of reps exceeds 1
         reps = imatrix()
         numpy.testing.assert_raises(ValueError, tile, x, reps)
@@ -5530,14 +5556,14 @@ def test_tile():
             if k > 1:
                 ndim = k-1
                 numpy.testing.assert_raises(ValueError, tile, x, reps, ndim)
-        
+
         # error raising test: reps is list, len(reps) > ndim
         r = [2, 3, 4, 5, 6]
         reps = r[:k+1]
         ndim = k
         numpy.testing.assert_raises(ValueError, tile, x, reps, ndim)
 
-        # error raising test: 
+        # error raising test:
         # reps is tensor.vector and len(reps_value) > ndim,
         # reps_value is the real value when excuting the function.
         reps = ivector()
@@ -6335,8 +6361,6 @@ def test_var():
     f = function([a], var(a))
 
     a_val = numpy.arange(60).reshape(3, 4, 5)
-    # print numpy.var(a_val)
-    # print f(a_val)
     assert numpy.allclose(numpy.var(a_val), f(a_val))
 
     f = function([a], var(a, axis=0))
@@ -6347,6 +6371,34 @@ def test_var():
 
     f = function([a], var(a, axis=2))
     assert numpy.allclose(numpy.var(a_val, axis=2), f(a_val))
+
+    f = function([a], var(a, axis=0, ddof=0))
+    assert numpy.allclose(numpy.var(a_val, axis=0, ddof=0), f(a_val))
+
+    f = function([a], var(a, axis=1, ddof=1))
+    assert numpy.allclose(numpy.var(a_val, axis=1, ddof=1), f(a_val))
+
+    f = function([a], var(a, axis=2, ddof=1))
+    assert numpy.allclose(numpy.var(a_val, axis=2, ddof=1), f(a_val))
+
+    f = function([a], var(a, ddof=0, corrected=True))
+    mean_a = numpy.mean(a_val)
+    centered_a = a_val - mean_a
+    v = numpy.mean(centered_a ** 2)
+    error = (numpy.mean(centered_a)) ** 2
+    v = v - error
+    assert numpy.allclose(v, f(a_val))
+
+    f = function([a], var(a, axis=2, ddof=1, corrected=True))
+    mean_a = numpy.mean(a_val, axis=2, keepdims=True)
+    centered_a = a_val - mean_a
+    v = numpy.var(a_val, axis=2, ddof=1)
+    shp_inp = numpy.shape(a_val)
+    shp = shp_inp - numpy.array(1)
+    error = (numpy.sum(centered_a, axis=2)) ** 2
+    error = numpy.true_divide(error, shp[1] * shp_inp[1])
+    v = v - error
+    assert numpy.allclose(v, f(a_val))
 
 
 class T_sum(unittest.TestCase):
@@ -6649,14 +6701,11 @@ class test_arithmetic_cast(unittest.TestCase):
                                     config.int_division == 'floatX'):
                                     assert theano_dtype == config.floatX
                                     continue
-                                numpy_version = [int(v) for v in
-                                                 numpy.__version__.split('.')[:2]]
                                 if (cfg == 'numpy+floatX' and
                                     a_type == 'complex128' and
                                     (b_type == 'float32' or
                                      b_type == 'float16') and
                                     combo == ('scalar', 'array') and
-                                    bool(numpy_version >= [1, 6]) and
                                     theano_dtype == 'complex128' and
                                     numpy_dtype == 'complex64'):
                                     # In numpy 1.6.x adding a complex128 with
@@ -6664,7 +6713,7 @@ class test_arithmetic_cast(unittest.TestCase):
                                     # of 1.9.2. this is still the case so it is
                                     # probably by design
                                     raise SkipTest("Known issue with"
-                                                   "numpy >= 1.6.x see #761")
+                                                   "numpy see #761")
                                 # In any other situation: something wrong is
                                 # going on!
                                 assert False
@@ -7004,7 +7053,7 @@ class T_get_scalar_constant_value(unittest.TestCase):
         assert get_scalar_constant_value(mv[0]) == 1
         assert get_scalar_constant_value(mv[1]) == 2
         assert get_scalar_constant_value(mv[2]) == 3
-        assert get_scalar_constant_value(mv[numpy.int8(0)]) == 1
+        assert get_scalar_constant_value(mv[numpy.int32(0)]) == 1
         assert get_scalar_constant_value(mv[numpy.int64(1)]) == 2
         assert get_scalar_constant_value(mv[numpy.uint(2)]) == 3
         t = theano.scalar.Scalar('int64')
@@ -7077,6 +7126,16 @@ class T_as_tensor_variable(unittest.TestCase):
                                mode='w+', shape=inp.shape)
         new_inp[...] = inp
         x = as_tensor_variable(new_inp)
+
+    def test_empty_dtype(self):
+        old = theano.config.floatX
+        for dtype in ['float16', 'float32', 'float64']:
+            try:
+                theano.config.floatX = dtype
+                assert theano.tensor.as_tensor_variable(()).dtype == dtype
+                assert theano.tensor.as_tensor_variable([]).dtype == dtype
+            finally:
+                theano.config.floatX = old
 
 
 class test_complex_mod(unittest.TestCase):
@@ -7533,17 +7592,17 @@ class TestInferShape(utt.InferShapeTester):
                                 [adtens4_bro_val], Rebroadcast)
 
         # Alloc
-        randint = numpy.random.random_integers
+        randint = numpy.random.randint
         adscal = dscalar()
         aiscal = lscalar()
         biscal = lscalar()
         ciscal = lscalar()
         discal = lscalar()
         adscal_val = rand()
-        aiscal_val = randint(3, 5, size=())
-        biscal_val = randint(3, 5, size=())
-        ciscal_val = randint(3, 5, size=())
-        discal_val = randint(3, 5, size=())
+        aiscal_val = randint(3, 6, size=())
+        biscal_val = randint(3, 6, size=())
+        ciscal_val = randint(3, 6, size=())
+        discal_val = randint(3, 6, size=())
         self._compile_and_check([adscal, aiscal, biscal, ciscal, discal],
                 [Alloc()(adscal, aiscal, biscal, ciscal, discal)],
                 [adscal_val, aiscal_val, biscal_val,
@@ -7998,8 +8057,7 @@ class T_Choose(utt.InferShapeTester):
         a = tensor.vector(dtype='int32')
         b = tensor.matrix(dtype='float32')
 
-        A = numpy.asarray(numpy.random.random_integers(0, 3, 4),
-                          dtype='int32')
+        A = numpy.random.randint(0, 4, 4).astype('int32')
         B = numpy.asarray(numpy.random.rand(4, 4), dtype='float32')
 
         for m in self.modes:
@@ -8046,8 +8104,7 @@ class T_Choose(utt.InferShapeTester):
         b = tensor.tensor3(dtype='float32')
         c = tensor.tensor3(dtype='float32')
 
-        A = numpy.asarray(numpy.random.random_integers(0, 1, (2, 1, 1)),
-                          dtype='int32')
+        A = numpy.random.randint(0, 2, (2, 1, 1)).astype('int32')
         B = numpy.asarray(numpy.random.rand(1, 6, 1), dtype='float32')
         C = numpy.asarray(numpy.random.rand(1, 1, 5), dtype='float32')
 

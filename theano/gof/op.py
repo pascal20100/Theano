@@ -32,6 +32,8 @@ __contact__ = "theano-dev <theano-dev@googlegroups.com>"
 
 __docformat__ = "restructuredtext en"
 
+_logger = logging.getLogger('theano.gof.op.Op')
+
 
 class CLinkerObject(object):
     """
@@ -694,6 +696,9 @@ class PureOp(object):
     # Python implementation #
     #########################
 
+    def L_op(self, inputs, outputs, output_grads):
+        return self.grad(inputs, output_grads)
+
     def R_op(self, inputs, eval_points):
         """
         This method is primarily used by tensor.Rop
@@ -779,76 +784,24 @@ class Op(utils.object2, PureOp, CLinkerOp):
     Convenience class to bundle `PureOp` and `CLinkerOp`.
 
     """
-    def __new__(cls, *args, **kwargs):
-        # this function exists to silently and transparently ensure that all
-        # existing Ops get a _op_use_c_code attribute
-        obj = object.__new__(cls)
-        if not hasattr(obj, '_op_use_c_code'):
-            obj._op_use_c_code = theano.config.cxx
-        return obj
-
-    def __init__(self, use_c_code=theano.config.cxx):
-        self._op_use_c_code = use_c_code
-
-    def _props(self):
-        """
-        Tuple of properties of all attributes
-        """
-        return tuple(getattr(self, a) for a in self.__props__)
-
-    def _props_dict(self):
-        """This return a dict of all ``__props__`` key-> value.
-
-        This is useful in optimization to swap op that should have the
-        same props. This help detect error that the new op have at
-        least all the original props.
-
-        """
-        return dict([(a, getattr(self, a))
-                     for a in self.__props__])
-
-    def __hash__(self):
-        if hasattr(self, '__props__'):
-            return hash((type(self), self._props()))
-        else:
-            return super(Op, self).__hash__()
-
-    def __str__(self):
-        if hasattr(self, '__props__'):
-            if len(self.__props__) == 0:
-                return "%s" % (self.__class__.__name__,)
-            else:
-                return "%s{%s}" % (
-                    self.__class__.__name__,
-                    ", ".join("%s=%r" % (p, getattr(self, p))
-                              for p in self.__props__))
-        else:
-            return super(Op, self).__str__()
-
-    def __eq__(self, other):
-        if hasattr(self, '__props__'):
-            return (type(self) == type(other) and self._props() ==
-                    other._props())
-        else:
-            return NotImplemented
-
-    def prepare_node(self, node, storage_map, compute_map):
+    def prepare_node(self, node, storage_map, compute_map, impl):
         """
         Make any special modifications that the Op needs before doing
         make_thunk().
 
-        This can either modify the node inplace or return a new one.
+        This can modify the node inplace and should return nothing.
+
+        It can be called multiple time with different impl. It is the
+        op responsability to don't re-prepare the node when it isn't
+        good to do so.
 
         """
         pass
 
     def make_c_thunk(self, node, storage_map, compute_map, no_recycling):
-        """
-        Like make_thunk, but will only try to make a C thunk.
+        """Like make_thunk, but will only try to make a C thunk.
 
         """
-        logger = logging.getLogger('theano.gof.op.Op')
-
         node_input_storage = [storage_map[r] for r in node.inputs]
         node_output_storage = [storage_map[r] for r in node.outputs]
 
@@ -870,7 +823,7 @@ class Op(utils.object2, PureOp, CLinkerOp):
         cl = theano.gof.cc.CLinker().accept(e,
                                             no_recycling=e_no_recycling)
 
-        logger.debug('Trying CLinker.make_thunk')
+        _logger.debug('Trying CLinker.make_thunk')
         outputs = cl.make_thunk(input_storage=node_input_storage,
                                 output_storage=node_output_storage)
         fill_storage, node_input_filters, node_output_filters = outputs
@@ -925,7 +878,8 @@ class Op(utils.object2, PureOp, CLinkerOp):
         rval.lazy = False
         return rval
 
-    def make_thunk(self, node, storage_map, compute_map, no_recycling):
+    def make_thunk(self, node, storage_map, compute_map, no_recycling,
+                   impl=None):
         """
         This function must return a thunk, that is a zero-arguments
         function that encapsulates the computation to be performed
@@ -946,6 +900,9 @@ class Op(utils.object2, PureOp, CLinkerOp):
         no_recycling
             List of variables for which it is forbidden to reuse memory
             allocated by a previous call.
+        impl
+            Currently, None, 'c' or 'py'. If 'c' or 'py' we will only try
+            that version of the code.
 
         Notes
         -----
@@ -955,28 +912,26 @@ class Op(utils.object2, PureOp, CLinkerOp):
         the thunk can potentially cache return values (like CLinker does),
         then it must not do so for variables in the no_recycling list.
 
+        self.prepare_node(node, ...) is always called. If we try 'c' and it
+        fail and we try again 'py', prepare_node will be called twice.
         """
-        logger = logging.getLogger('theano.gof.op.Op')
 
-        new_node = self.prepare_node(node, storage_map=storage_map,
-                                     compute_map=compute_map)
-        if new_node is not None:
-            node = new_node
-        if not hasattr(self, '_op_use_c_code'):
-            warnings.warn(
-                "The  __getstate__ method of '%s' is not implemented correctly."
-                " It should keep the attributes added by the base class."
-                " To implement it correctly, it should keep all attributes"
-                " and only remove those it does not want." % (self),
-                stacklevel=2)
-        if getattr(self, '_op_use_c_code', theano.config.cxx):
+        if impl is None or impl == 'c':
+            self.prepare_node(node, storage_map=storage_map,
+                              compute_map=compute_map, impl='c')
             try:
                 return self.make_c_thunk(node, storage_map, compute_map,
                                          no_recycling)
             except (NotImplementedError, utils.MethodNotDefined):
-                logger.debug('Falling back on perform')
+                # We requested the c code, so don't catch the error.
+                if impl == 'c':
+                    raise
+                _logger.debug('Falling back on perform')
 
-        # condition: either there was no c_code, or it failed
+        # condition: either there was no c_code, or it failed or
+        # python code was requested.
+        self.prepare_node(node, storage_map=storage_map,
+                          compute_map=compute_map, impl='py')
         return self.make_py_thunk(node, storage_map, compute_map, no_recycling)
 
     def make_node(self, *inputs):
@@ -1239,9 +1194,9 @@ int main( int argc, const char* argv[] )
                 self.openmp = False
                 theano.config.openmp = False
 
-    def prepare_node(self, node, storage_map,
-                     compute_map):
-        self.update_self_openmp()
+    def prepare_node(self, node, storage_map, compute_map, impl):
+        if impl == 'c':
+            self.update_self_openmp()
 
 
 def simple_meth(tag):
@@ -1434,7 +1389,15 @@ class COp(Op):
         # Generate an string containing the arguments sent to the external C
         # function. The argstring will be of format :
         # "input0, input1, input2, &output0, &output1"
-        return ", ".join(list(inp) + ["&%s" % o for o in out])
+        inp = list(inp)
+        numi = getattr(self, '_cop_num_inputs', len(inp))
+        while len(inp) < numi:
+            inp.append('NULL')
+        out = ["&%s" % o for o in out]
+        numo = getattr(self, '_cop_num_outputs', len(out))
+        while len(out) < numo:
+            out.append('NULL')
+        return ", ".join(inp + out)
 
     def get_c_macros(self, node, name, check_input=None):
         define_template = "#define %s %s"

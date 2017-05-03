@@ -99,7 +99,7 @@ possibilities you may encounter or need.  For that refer to
             pass
 
         # Other implementations (pycuda, ...):
-        def make_thunk(self, node, storage_map, _, _2):
+        def make_thunk(self, node, storage_map, _, _2, impl=None):
             pass
 
         # optional:
@@ -190,11 +190,12 @@ or :func:`make_thunk`.
       valid, but shouldn't be required anymore for this call.
       The returned function must ensure that it sets the computed
       variables as computed in the `compute_map`.
-
+    - ``impl`` allow to select between multiple implementation.
+      It should have a default value of None.
 
   :func:`make_thunk` is useful if you want to generate code and compile
   it yourself. For example, this allows you to use PyCUDA to compile GPU
-  code.
+  code and keep state in the thunk.
 
   If :func:`make_thunk()` is defined by an op, it will be used by Theano
   to obtain the op's implementation.
@@ -500,9 +501,6 @@ and ``b`` are equal.
             super(AXPBOp, self).__init__()
 
         def make_node(self, x):
-            # check that the theano version has support for __props__.
-            assert hasattr(self, '_props'), ("Your version of theano is too"
-                                             "old to support __props__.")
             x = theano.tensor.as_tensor_variable(x)
             return theano.Apply(self, [x], [x.type()])
 

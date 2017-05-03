@@ -5,6 +5,7 @@ Tensor optimizations addressing the ops in basic.py.
 # TODO: intelligent merge for mul/add
 # TODO: 0*x -> 0
 
+from collections import defaultdict
 import logging
 import itertools
 import operator
@@ -22,7 +23,7 @@ from theano import gof
 from theano.compat import izip
 from theano.gof import opt, InconsistencyError, TopoOptimizer, graph
 from theano.gof import Variable, Constant
-from theano.gof.opt import copy_stack_trace
+from theano.gof.opt import copy_stack_trace, in2out
 from theano.gof.utils import MethodNotDefined
 from theano.gradient import DisconnectedType
 from theano.configparser import config
@@ -39,7 +40,7 @@ from theano import scalar
 from theano.scalar import basic
 from theano.tensor import basic as T
 from theano import compile  # to register the optimizer built by this file
-from theano.compile.ops import Shape_i
+from theano.compile.ops import Shape, Shape_i
 from theano.tensor.type import (values_eq_approx_remove_inf,
                                 values_eq_approx_remove_nan,
                                 values_eq_approx_remove_inf_nan)
@@ -48,50 +49,13 @@ from theano.gof.opt import (Optimizer, pre_constant_merge,
                             pre_greedy_local_optimizer)
 from theano.gof import toolbox
 from theano.tensor.basic import (Alloc, get_scalar_constant_value, ShapeError,
-                                 extract_constant, NotScalarConstantError)
+                                 extract_constant, NotScalarConstantError,
+                                 Reshape)
 from six import StringIO
 
 _logger = logging.getLogger('theano.tensor.opt')
 
 # Utilities
-
-
-def out2in(*local_opts, **kwargs):
-    """WRITEME """
-    name = (kwargs and kwargs.pop('name', None))
-    if len(local_opts) > 1:
-        # Don't wrap it uselessly if their is only 1 optimization.
-        local_opts = opt.LocalOptGroup(*local_opts)
-    else:
-        local_opts, = local_opts
-        if not name:
-            name = local_opts.__name__
-    ret = opt.TopoOptimizer(local_opts,
-                            order='out_to_in',
-                            failure_callback=TopoOptimizer.warn_inplace,
-                            **kwargs)
-    if name:
-        ret.__name__ = name
-    return ret
-
-
-def in2out(*local_opts, **kwargs):
-    """WRITEME """
-    name = (kwargs and kwargs.pop('name', None))
-    if len(local_opts) > 1:
-        # Don't wrap it uselessly if their is only 1 optimization.
-        local_opts = opt.LocalOptGroup(*local_opts)
-    else:
-        local_opts, = local_opts
-        if not name:
-            name = local_opts.__name__
-    ret = opt.TopoOptimizer(local_opts,
-                            order='in_to_out',
-                            failure_callback=TopoOptimizer.warn_inplace,
-                            **kwargs)
-    if name:
-        ret.__name__ = name
-    return ret
 
 
 def _fill_chain(new_out, orig_inputs):
@@ -183,14 +147,34 @@ def broadcast_like(value, template, fgraph, dtype=None):
     return rval
 
 
-def inplace_elemwise_optimizer_op(OP):
+class InplaceElemwiseOptimizer(Optimizer):
     """
     We parametrise it to make it work for Elemwise and GpuElemwise op.
     """
-    @gof.inplace_optimizer
-    def inplace_elemwise_optimizer(fgraph):
+    def __init__(self, OP):
+        self.op = OP
+
+    def add_requirements(self, fgraph):
+        fgraph.attach_feature(theano.gof.destroyhandler.DestroyHandler())
+
+    @staticmethod
+    def print_profile(stream, prof, level=0):
+        blanc = ('    ' * level)
+        print(blanc, "InplaceElemwiseOptimizer ", prof['opt'].op, file=stream)
+        for k in ['node_before',
+                  'nb_call_replace',
+                  'nb_call_validate',
+                  'nb_inconsistent']:
+            print(blanc, k, prof[k], file=stream)
+        ndim = prof['ndim']
+        if ndim:
+            print(blanc, "ndim", "nb", file=stream)
+            for n in sorted(ndim.keys()):
+                print(blanc, n, ndim[n], file=stream)
+
+    def apply(self, fgraph):
         """
-        Usage: inplace_elemwise_optimizer.optimize(fgraph)
+        Usage: InplaceElemwiseOptimizer(op).optimize(fgraph)
 
         Attempts to replace all Broadcast ops by versions of them
         that operate inplace. It operates greedily: for each Broadcast
@@ -200,8 +184,10 @@ def inplace_elemwise_optimizer_op(OP):
 
         Examples
         --------
-        x + y + z -> x += y += z
-        (x + y) * (x * y) -> (x += y) *= (x * y) or (x + y) *= (x *= y)
+
+            `x + y + z -> x += y += z`
+
+            `(x + y) * (x * y) -> (x += y) *= (x * y) or (x + y) *= (x *= y)`
 
         """
         # We should not validate too often as this takes too much time to
@@ -224,6 +210,13 @@ def inplace_elemwise_optimizer_op(OP):
         # the solution is also applicable there.
 
         # We execute `validate` after this number of change.
+        prof = {'opt': self,
+                'node_before': len(fgraph.apply_nodes),
+                'nb_call_replace': 0,
+                'nb_call_validate': 0,
+                'nb_inconsistent': 0,
+                'ndim': defaultdict(lambda: 0)}
+
         check_each_change = config.tensor.insert_inplace_optimizer_validate_nb
         if check_each_change == -1:
             if len(fgraph.apply_nodes) > 500:
@@ -247,7 +240,7 @@ def inplace_elemwise_optimizer_op(OP):
         for node in list(graph.io_toposort(fgraph.inputs, fgraph.outputs)):
             op = node.op
             # gpuarray GpuElemwise inherit from Elemwise
-            if not type(op) == OP:
+            if not type(op) == self.op:
                 continue
             # If big graph and the outputs are scalar, do not make it
             # inplace.
@@ -364,19 +357,23 @@ def inplace_elemwise_optimizer_op(OP):
                                 scalar.transfer_type(
                                     *[inplace_pattern.get(i, None)
                                       for i in xrange(len(node.outputs))]))
-                        new_outputs = OP(new_scal, inplace_pattern)(
+                        new_outputs = self.op(new_scal, inplace_pattern)(
                             *node.inputs, **dict(return_list=True))
                         new_node = new_outputs[0].owner
 
                         for r, new_r in zip(node.outputs, new_outputs):
+                            prof['nb_call_replace'] += 1
                             fgraph.replace(r, new_r,
                                            reason="inplace_elemwise_optimizer")
                         nb_change_no_validate += 1
+                        prof['ndim'][candidate_out_var.ndim] += 1
                         if nb_change_no_validate >= check_each_change:
+                            prof['nb_call_validate'] += 1
                             fgraph.validate()
                             chk = fgraph.checkpoint()
                             nb_change_no_validate = 0
                     except (ValueError, InconsistencyError) as e:
+                        prof['nb_inconsistent'] += 1
                         if check_each_change != 1 and not raised_warning:
                             print(("Some inplace optimization was not "
                                    "performed due to unexpected error:"),
@@ -399,13 +396,31 @@ def inplace_elemwise_optimizer_op(OP):
                            "performed due to unexpected error"),
                           file=sys.stderr)
                 fgraph.revert(chk)
-    return inplace_elemwise_optimizer
+        return prof
 
-inplace_elemwise_optimizer = inplace_elemwise_optimizer_op(T.Elemwise)
+    def print_summary(self, stream=sys.stdout, level=0, depth=-1):
+        print("%s%s (%s)" % (
+            (' ' * level), self.__class__.__name__, self.op), file=stream)
+        return inplace_elemwise_optimizer
+
+inplace_elemwise_optimizer = InplaceElemwiseOptimizer(T.Elemwise)
 compile.optdb.register('inplace_elemwise_opt', inplace_elemwise_optimizer, 75,
                        'inplace_opt',  # for historic reason
                        'inplace_elemwise_optimizer',
                        'fast_run', 'inplace')
+
+
+def register_useless(lopt, *tags, **kwargs):
+    if type(lopt) == str:
+        def register(inner_lopt):
+            return register_useless(inner_lopt, lopt, *tags, **kwargs)
+        return register
+    else:
+        name = kwargs.pop('name', None) or lopt.__name__
+
+        compile.mode.local_useless.register(name, lopt, 'last', 'fast_run',
+                                            *tags, **kwargs)
+        return lopt
 
 
 def register_canonicalize(lopt, *tags, **kwargs):
@@ -574,25 +589,6 @@ def local_dimshuffle_lift(node):
 
     """
     op = node.op
-    if (isinstance(op, T.Reshape) and
-            node.inputs[0].owner is not None and
-            isinstance(node.inputs[0].owner.op, DimShuffle)):
-        new_order = node.inputs[0].owner.op.new_order
-        new_order = [i for i in new_order if i != 'x']
-        input = node.inputs[0].owner.inputs[0]
-        broadcastables = input.broadcastable
-        new_order_of_nonbroadcastables = []
-        for i, bd in zip(new_order, broadcastables):
-            if not bd:
-                new_order_of_nonbroadcastables.append(i)
-        no_change_in_order = all(
-            new_order_of_nonbroadcastables[i] <= new_order_of_nonbroadcastables[i + 1]
-            for i in xrange(len(new_order_of_nonbroadcastables) - 1))
-        if no_change_in_order:
-            shape = node.inputs[1]
-            ret = op.__class__(node.outputs[0].ndim)(input, shape)
-            copy_stack_trace(node.outputs[0], ret)
-            return [ret]
     if not isinstance(op, DimShuffle):
         return False
 
@@ -604,8 +600,7 @@ def local_dimshuffle_lift(node):
         new_inputs = []
         for inp in inode.inputs:
             new_inp = op.__class__(inp.type.broadcastable,
-                                   op.new_order,
-                                   op.inplace)(inp)
+                                   op.new_order)(inp)
             new_inputs.append(apply_local_dimshuffle_lift(new_inp))
         copy_stack_trace(node.outputs[0], new_inputs)
         ret = inode.op(*new_inputs, **dict(return_list=True))
@@ -613,21 +608,55 @@ def local_dimshuffle_lift(node):
     if inode and isinstance(inode.op, DimShuffle):
         new_order = [x == 'x' and 'x' or inode.op.new_order[x] for x in
                      new_order]
-        inplace = op.inplace and inode.op.inplace
         input = inode.inputs[0]
 
     if is_dimshuffle_useless(new_order, input):
         return [input]
     elif inode and isinstance(inode.op, DimShuffle):
-        ret = op.__class__(input.type.broadcastable, new_order,
-                           inplace)(input)
+        ret = op.__class__(input.type.broadcastable, new_order)(input)
         ret = apply_local_dimshuffle_lift(ret)
         copy_stack_trace(node.outputs[0], ret)
         return [ret]
 
 
 @register_canonicalize
-@gof.local_optimizer([T.DimShuffle])
+@gof.local_optimizer([Reshape])
+def local_useless_dimshuffle_in_reshape(node):
+    """
+    Removes useless DimShuffle operation inside Reshape:
+
+      reshape(vector.dimshuffle('x', 0), shp) => reshape(vector, shp)
+      reshape(matrix.dimshuffle('x', 0, 'x', 1), shp) => reshape(matrix, shp)
+      reshape(row.dimshuffle(1, 'x'), shp) => reshape(row, shp)
+      reshape(col.dimshuffle(0), shp) => reshape(col, shp)
+
+    """
+    op = node.op
+    if not isinstance(op, Reshape):
+        return False
+    if not (node.inputs[0].owner is not None and
+            isinstance(node.inputs[0].owner.op, DimShuffle)):
+        return False
+
+    new_order = node.inputs[0].owner.op.new_order
+    input = node.inputs[0].owner.inputs[0]
+    broadcastables = node.inputs[0].broadcastable
+    new_order_of_nonbroadcast = []
+    for i, bd in zip(new_order, broadcastables):
+        if not bd:
+            new_order_of_nonbroadcast.append(i)
+    no_change_in_order = all(
+        new_order_of_nonbroadcast[i] <= new_order_of_nonbroadcast[i + 1]
+        for i in xrange(len(new_order_of_nonbroadcast) - 1))
+    if no_change_in_order:
+        shape = node.inputs[1]
+        ret = op.__class__(node.outputs[0].ndim)(input, shape)
+        copy_stack_trace(node.outputs[0], ret)
+        return [ret]
+
+
+@register_canonicalize
+@gof.local_optimizer([DimShuffle])
 def local_lift_transpose_through_dot(node):
     """
     dot(x,y).T -> dot(y.T, x.T)
@@ -656,39 +685,13 @@ def local_lift_transpose_through_dot(node):
         copy_stack_trace(node.inputs[0], ret)
         return ret
 
-
-@gof.local_optimizer([DimShuffle])
-def dimshuffle_as_view(node):
-    op = node.op
-    if not isinstance(op, DimShuffle) or op.inplace:
-        return False
-    new_op = op.__class__(op.input_broadcastable, op.new_order, inplace=True)
-    v = new_op(*node.inputs)
-    copy_stack_trace(node.outputs[0], v)
-    return [v]
-
-# Step 60 is the inplace optimization stage.
-compile.optdb.register('dimshuffle_as_view',
-                       TopoOptimizer(
-                           dimshuffle_as_view,
-                           failure_callback=TopoOptimizer.warn_inplace),
-                       60,
-                       'fast_run', 'inplace')
 register_canonicalize(local_dimshuffle_lift)
 register_specialize(local_dimshuffle_lift)
-
-
-@register_canonicalize
-@gof.local_optimizer([T.DimShuffle])
-def local_dimshuffle_no_inplace_at_canonicalize(node):
-    if isinstance(node.op, T.DimShuffle) and node.op.inplace:
-        return [T.DimShuffle(node.op.input_broadcastable,
-                             node.op.new_order, inplace=False)(node.inputs[0])]
-
 
 ######################
 # Casting operations #
 ######################
+
 
 @register_canonicalize
 @register_specialize
@@ -837,8 +840,7 @@ class MakeVectorPrinter:
         else:
             raise TypeError("Can only print make_vector.")
 
-T.pprint.assign(lambda pstate, r: r.owner and
-                isinstance(r.owner.op, MakeVector), MakeVectorPrinter())
+T.pprint.assign(MakeVector, MakeVectorPrinter())
 
 
 class ShapeFeature(object):
@@ -1334,7 +1336,11 @@ class ShapeFeature(object):
                     assert d.dtype in theano.tensor.discrete_dtypes, (node, d.dtype)
                     assert str(d.dtype) != 'uint64', node
                     new_shape += sh[len(new_shape):i + 1]
-                    new_shape[i] = theano.tensor.cast(d, 'int64')
+                    if isinstance(d, T.Constant):
+                        casted_d = T.constant(d.data, dtype='int64')
+                    else:
+                        casted_d = theano.tensor.cast(d, 'int64')
+                    new_shape[i] = casted_d
             if new_shape:
                 # We replace the shape with wrong dtype by the one with
                 # 'int64'.
@@ -1738,6 +1744,7 @@ compile.optdb.register('local_elemwise_alloc',
 
 
 @register_canonicalize("fast_compile")
+@register_useless
 @gof.local_optimizer([T.fill])
 def local_useless_fill(node):
     """fill(s,v) -> v
@@ -1758,6 +1765,7 @@ def local_useless_fill(node):
 @register_specialize
 @register_stabilize
 @register_canonicalize
+@register_useless
 @gof.local_optimizer([T.alloc])
 def local_useless_alloc(node):
     """
@@ -1778,7 +1786,43 @@ def local_useless_alloc(node):
         # We don't need to copy over any stack traces here
         return [input]
 
+
+@register_specialize
+@register_stabilize
+@register_canonicalize
+@gof.local_optimizer([T.alloc])
+def local_canonicalize_alloc(node):
+    """If the input type is the same as the output type (dtype and broadcast)
+    there is no change in the shape of the input. So this is just a simple copy
+    of the input. This is not needed. (as local_useless_alloc)
+
+    Also, it will canonicalize alloc by creating Dimshuffle after the
+    alloc to introduce the dimensions of constant size 1.
+
+    See https://github.com/Theano/Theano/issues/4072 to know why this
+    is needed.
+
+    """
+    op = node.op
+    if not isinstance(op, Alloc):
+        return False
+
+    input = node.inputs[0]
+    output = node.outputs[0]
+
+    # Check if dtype and broadcast remain the same.
+    if input.type == output.type:
+        # We don't need to copy over any stack traces here
+        return [input]
+
+    # Allow local_merge_alloc to do its work first
+    clients = getattr(output, 'clients', [])
+    for client, i in clients:
+        if client != "output" and isinstance(client.op, Alloc):
+            return
+
     # Check if alloc adds a broadcastable dimension with shape 1.
+
     output_shape = node.inputs[1:]
     num_dims_with_size_1_added_to_left = 0
     for i in range(len(output_shape) - input.ndim):
@@ -1901,6 +1945,7 @@ def local_subtensor_remove_broadcastable_index(node):
 
 @register_specialize
 @register_canonicalize('fast_compile_gpu')
+@register_useless
 @gof.local_optimizer([Subtensor, AdvancedSubtensor1])
 def local_subtensor_make_vector(node):
     """
@@ -1952,17 +1997,17 @@ def local_subtensor_make_vector(node):
                     ret = [x.owner.inputs[v]]
                 except IndexError:
                     raise NotScalarConstantError("Bad user graph!")
-
                 return ret
             except NotScalarConstantError:
                 pass
         elif idx.ndim == 1 and isinstance(idx, T.Constant):
             values = list(map(int, list(idx.value)))
-            ret = [make_vector(*[x.owner.inputs[v] for v in values])]
+            ret = make_vector(*[x.owner.inputs[v] for v in values])
 
             # Copy over stack trace from previous output to new output
             copy_stack_trace(node.outputs[0], ret)
-            return ret
+            ret = T.patternbroadcast(ret, node.outputs[0].broadcastable)
+            return [ret]
         else:
             raise TypeError('case not expected')
     elif isinstance(idx, slice):
@@ -1975,6 +2020,7 @@ def local_subtensor_make_vector(node):
             ret = make_vector(*x.owner.inputs[const_slice])
             # Copy over stack trace from previous outputs to new output
             copy_stack_trace(node.outputs, ret)
+            ret = T.patternbroadcast(ret, node.outputs[0].broadcastable)
             return [ret]
         except NotScalarConstantError:
             pass
@@ -1984,6 +2030,7 @@ def local_subtensor_make_vector(node):
 
 # TODO: the other optimization for and, or, xor, le and ge see ticket #496.
 
+@register_useless
 @register_canonicalize('fast_compile')
 @register_specialize
 @gof.local_optimizer([T.Elemwise])
@@ -2002,36 +2049,26 @@ def local_useless_elemwise(node):
 
     """
     if isinstance(node.op, T.Elemwise):
-        def zeros_like(node, in_idx):
-            # it is the same var in the graph. That will always be true
-            return [T.fill(node.inputs[in_idx],
-                           T.constant(0.0, dtype=node.outputs[0].type.dtype))]
-
-        def ones_like(node, in_idx):
-            # it is the same var in the graph. That will always be true
-            return [T.fill(node.inputs[in_idx],
-                           T.constant(1.0, dtype=node.outputs[0].type.dtype))]
+        # We call zeros_like and one_like with opt=True to generate a
+        # cleaner graph.
+        dtype = node.outputs[0].dtype
 
         if node.op.scalar_op == theano.scalar.eq and len(node.inputs) == 2:
             if node.inputs[0] == node.inputs[1]:
                 # it is the same var in the graph. That will always be true
-                ret = [T.fill(node.inputs[0],
-                              T.constant(1.0,
-                                         dtype=node.outputs[0].type.dtype))]
+                ret = T.ones_like(node.inputs[0], dtype=dtype, opt=True)
 
                 # Copy stack trace from input to constant output
                 copy_stack_trace(node.outputs[0], ret)
-                return ret
+                return [ret]
         elif node.op.scalar_op == theano.scalar.neq and len(node.inputs) == 2:
             if node.inputs[0] == node.inputs[1]:
                 # it is the same var in the graph. That will always be false
-                ret = [T.fill(node.inputs[0],
-                              T.constant(0.0,
-                                         dtype=node.outputs[0].type.dtype))]
+                ret = T.zeros_like(node.inputs[0], dtype=dtype, opt=True)
 
                 # Copy stack trace from input to constant output
                 copy_stack_trace(node.outputs[0], ret)
-                return ret
+                return [ret]
 
         elif node.op.scalar_op == theano.scalar.mul and len(node.inputs) == 1:
             # No need to copy over any stack trace
@@ -2051,17 +2088,19 @@ def local_useless_elemwise(node):
                 const_val = T.extract_constant(node.inputs[0], only_process_constants=True)
                 if not isinstance(const_val, Variable):
                     if const_val == 0:
-                        return zeros_like(node, 1)
+                        return [T.zeros_like(node.inputs[1], dtype=dtype,
+                                             opt=True)]
                     else:
-                        return [node.inputs[1]]
+                        return [node.inputs[1].astype(node.outputs[0].dtype)]
 
             if isinstance(node.inputs[1], T.TensorConstant):
                 const_val = T.extract_constant(node.inputs[1], only_process_constants=True)
                 if not isinstance(const_val, Variable):
                     if const_val == 0:
-                        return zeros_like(node, 0)
+                        return [T.zeros_like(node.inputs[0], dtype=dtype,
+                                             opt=True)]
                     else:
-                        return [node.inputs[0]]
+                        return [node.inputs[0].astype(node.outputs[0].dtype)]
 
         elif (isinstance(node.op.scalar_op, scalar.OR) and
               len(node.inputs) == 2):
@@ -2070,22 +2109,24 @@ def local_useless_elemwise(node):
                 const_val = T.extract_constant(node.inputs[0], only_process_constants=True)
                 if not isinstance(const_val, Variable):
                     if const_val == 0:
-                        return [node.inputs[1]]
+                        return [node.inputs[1].astype(node.outputs[0].dtype)]
                     else:
-                        return ones_like(node, 1)
+                        return [T.ones_like(node.inputs[1], dtype=dtype,
+                                            opt=True)]
 
             if isinstance(node.inputs[1], T.TensorConstant):
                 const_val = T.extract_constant(node.inputs[1], only_process_constants=True)
                 if not isinstance(const_val, Variable):
                     if const_val == 0:
-                        return [node.inputs[0]]
+                        return [node.inputs[0].astype(node.outputs[0].dtype)]
                     else:
-                        return ones_like(node, 0)
+                        return [T.ones_like(node.inputs[0], dtype=dtype,
+                                            opt=True)]
 
         elif (isinstance(node.op.scalar_op, scalar.XOR) and
               len(node.inputs) == 2):
             if node.inputs[0] is node.inputs[1]:
-                return zeros_like(node, 0)
+                return [T.zeros_like(node.inputs[0], dtype=dtype, opt=True)]
 
 
 @register_specialize
@@ -2210,7 +2251,7 @@ class Assert(T.Op):
     >>> func = theano.function([x], assert_op(x, x.size<2))
 
     """
-
+    _f16_ok = True
     __props__ = ('msg',)
     view_map = {0: [0]}
 
@@ -2409,6 +2450,7 @@ def local_upcast_elemwise_constant_inputs(node):
 ##################
 
 
+@register_useless
 @register_canonicalize
 @register_specialize
 @gof.local_optimizer([IncSubtensor])
@@ -2499,6 +2541,7 @@ def local_set_to_inc_subtensor(node):
         return [ret]
 
 
+@register_useless
 @register_canonicalize
 @register_specialize
 @gof.local_optimizer([Subtensor])
@@ -2539,6 +2582,11 @@ def local_useless_subtensor(node):
     list/vector or the ARange op.
 
     """
+
+    # If the optimization is tried over a node that is not a part of graph before
+    if not hasattr(node, 'fgraph'):
+        return
+
     # This optimization needs ShapeOpt and fgraph.shape_feature
     if not hasattr(node.fgraph, 'shape_feature'):
         return
@@ -2969,11 +3017,18 @@ def local_subtensor_merge(node):
             return [out]
 
 
+@register_useless
 @register_canonicalize
 @register_specialize
 @gof.local_optimizer([Subtensor])
 def local_subtensor_of_alloc(node):
-    """alloc[x:y] -> alloc"""
+    """
+
+    alloc(val)[x:y] -> alloc(val[...])
+    alloc(val)[x:y] -> alloc(val)
+    This can be seen as a lift, but it also reduce the number of computation/memory.
+
+    """
     if not isinstance(node.op, Subtensor):
         return False
     u = node.inputs[0]
@@ -3027,14 +3082,10 @@ def local_subtensor_of_alloc(node):
     if type(rval) not in (list, tuple):
         rval = [rval]
     if rval[0].type != node.outputs[0].type:
-        # It happen that the make_node() isn't able to infer that some
-        # dimensions are broadcastable, but that now we can infer
-        # that. So we need to remove that information here.
-        rval[0] = theano.tensor.unbroadcast(
-            rval[0],
-            *[i for i, (b1, b2) in enumerate(zip(rval[0].broadcastable,
-                                                 node.outputs[0].broadcastable))
-              if b1 and not b2])
+        # It happen that the make_node() isn't able to infer the same pattern.
+        # We know it is safe, so fix that.
+        rval[0] = T.patternbroadcast(rval[0], node.outputs[0].broadcastable)
+
     return rval
 
 
@@ -3354,6 +3405,7 @@ def local_adv_sub1_adv_inc_sub1(node):
 @register_specialize
 @register_stabilize
 @register_canonicalize
+@register_useless
 @gof.local_optimizer([IncSubtensor,
                       AdvancedIncSubtensor,
                       AdvancedIncSubtensor1])
@@ -3465,6 +3517,7 @@ def local_useless_inc_subtensor_alloc(node):
 # Rebroadcast opts #
 ####################
 
+@register_useless
 @register_canonicalize
 @register_specialize
 @gof.local_optimizer([T.Rebroadcast])
@@ -3592,6 +3645,7 @@ def apply_rebroadcast_opt(rval):
 #############
 @register_specialize
 @register_canonicalize
+@register_useless
 @gof.local_optimizer([T.Join])
 def local_join_1(node):
     """Join(i, x) => x
@@ -3608,6 +3662,8 @@ def local_join_1(node):
         return [tensors[0]]
 
 
+# TODO: merge in local_useless_join
+@register_useless
 @register_specialize
 @register_canonicalize
 @gof.local_optimizer([T.Join])
@@ -3664,6 +3720,7 @@ def local_join_empty(node):
 
 @register_specialize
 @register_canonicalize
+@register_useless
 @gof.local_optimizer([T.Join])
 def local_join_make_vector(node):
     """Join(0, make_vector1, make_vector2, ...) => Join(0, make_vector12, ...)
@@ -3766,6 +3823,7 @@ def local_expm1(node):
 ###############
 # Switch opts #
 ###############
+@register_useless('local_remove_switch_const_cond')
 @register_canonicalize('fast_compile', 'local_remove_switch_const_cond')
 @register_specialize
 @gof.local_optimizer([T.Elemwise])
@@ -4034,6 +4092,7 @@ def local_merge_switch_same_cond(node):
 #############
 # Tile Opts #
 #############
+@register_useless
 @register_canonicalize
 @register_stabilize
 @gof.local_optimizer([T.Tile])
@@ -4080,6 +4139,7 @@ def local_useless_tile(node):
 ##############
 # Split Opts #
 ##############
+@register_useless
 @register_canonicalize
 @register_specialize
 @gof.local_optimizer([T.Split])
@@ -4160,20 +4220,141 @@ register_canonicalize(local_reshape_chain(T.Reshape),
                       name='local_reshape_chain')
 
 
+@register_useless
 @register_canonicalize
 @register_stabilize
 @gof.local_optimizer([T.Reshape])
 def local_useless_reshape(node):
     """
-    Remove Reshape when both the input and the output have a
-    single dimension.
+    Remove two kinds of useless reshape.
+
+    Remove Reshape when both the input and output have a single dimension.
+    Remove Reshape when reshaping to the shape of the input.
 
     """
-    if isinstance(node.op, T.Reshape):
-        if (node.inputs[0].ndim == 1 and node.outputs[0].ndim == 1 and
-                node.inputs[0].broadcastable ==
-                node.outputs[0].broadcastable):
-            return [node.inputs[0]]
+    op = node.op
+    if not isinstance(op, Reshape):
+        return False
+
+    input = node.inputs[0]
+    output = node.outputs[0]
+    output_shape = node.inputs[1]
+
+    if input.ndim != output.ndim:
+        return False
+
+    # Simple case: both input and output have a single dimension.
+    # This could hide errors if the user provides inconsistent shapes.
+    if (input.ndim == 1 and output.ndim == 1 and
+            input.broadcastable == output.broadcastable):
+        return [input]
+
+    # Second case: all the shapes match the input shape
+    # Match Reshape(x, x.shape)
+    if output_shape.owner and isinstance(output_shape.owner.op, Shape):
+        shape_input = output_shape.owner.inputs[0]
+        if shape_input == input:
+            return [input]
+
+    # Match Reshape(x, [x.shape[0], ..., x.shape[-1]]), accounting for
+    # broadcastable and constant dimensions
+    if output_shape.owner and isinstance(output_shape.owner.op, MakeVector):
+        output_shape_is = output_shape.owner.inputs
+
+        if not hasattr(node, 'fgraph'):
+            shape_feature = None
+        else:
+            shape_feature = getattr(node.fgraph, 'shape_feature', None)
+
+        shape_match = [False] * input.ndim
+        for dim in xrange(input.ndim):
+            outshp_i = output_shape_is[dim]
+            # Match Shape_i{dim}(input)
+            if (outshp_i.owner and isinstance(outshp_i.owner.op, Shape_i) and
+                    outshp_i.owner.op.i == dim and
+                    outshp_i.owner.inputs[0] == input):
+                shape_match[dim] = True
+                continue
+
+            # Match Shape(input)[dim]
+            if (outshp_i.owner and isinstance(outshp_i.owner.op, Subtensor) and
+                    len(outshp_i.owner.inputs) == 2 and
+                    extract_constant(outshp_i.owner.inputs[1]) == dim):
+                subtensor_inp = outshp_i.owner.inputs[0]
+                if (subtensor_inp.owner and
+                        isinstance(subtensor_inp.owner.op, Shape)):
+                    shape_input_i = subtensor_inp.owner.inputs[0]
+                    if shape_input_i == input:
+                        shape_match[dim] = True
+                        continue
+
+            # Match 1 if input.broadcastable[dim] is True
+            if (input.broadcastable[dim] and
+                    extract_constant(outshp_i, only_process_constants=1) == 1):
+                shape_match[dim] = True
+                continue
+
+            # Match shape_of[input][dim] or its constant equivalent
+            if shape_feature:
+                inpshp_i = shape_feature.get_shape(input, dim)
+                if (inpshp_i == outshp_i or
+                    (extract_constant(inpshp_i, only_process_constants=1) ==
+                     extract_constant(outshp_i, only_process_constants=1))):
+                    shape_match[dim] = True
+                    continue
+
+        if all(shape_match):
+            return [input]
+
+        # TODO later: if all the shapes except one match, we may want to
+        # consider it useless as well, like we do in the 1-dim case.
+
+
+@register_canonicalize
+@gof.local_optimizer([T.Reshape])
+def local_reshape_to_dimshuffle(node):
+    """
+    Broadcastable dimensions in Reshape are replaced with dimshuffle.
+
+    The goal is to avoid using reshape to add or remove broadcastable
+    dimensions, but use dimshuffle instead, so dimshuffles can cancel out
+    or be removed later on.
+
+    For example:
+        - reshape(x, (1, n)) --> dimshuffle{x,0}(reshape(x, (n,))
+        - reshape(x, (1, m, 1, n, 1, 1))
+          --> dimshuffle{x,0,x,1,x,x}(reshape(x, (m, n)))
+
+    """
+    op = node.op
+    if not isinstance(op, Reshape):
+        return False
+
+    input = node.inputs[0]
+    output = node.outputs[0]
+    output_shape = node.inputs[1]
+
+    dimshuffle_new_order = []
+    new_output_shape = []
+    index = 0  # index over the output of the new reshape
+    for i in xrange(output.ndim):
+        # Since output_shape is a symbolic vector, we trust extract_constant
+        # to go through however it is formed to see if its i-th element is 1.
+        # We need only_process_constants=False for that.
+        dim = extract_constant(output_shape[i], only_process_constants=False,
+                               elemwise=False)
+        if dim == 1:
+            dimshuffle_new_order.append('x')
+        else:
+            dimshuffle_new_order.append(index)
+            new_output_shape.append(dim)
+            index = index + 1
+    if index != output.ndim:
+        inner = op.__class__(len(new_output_shape))(input, new_output_shape)
+        copy_stack_trace(output, inner)
+        new_node = [DimShuffle(inner.type.broadcastable, dimshuffle_new_order)(inner)]
+        copy_stack_trace(output, new_node)
+        return new_node
 
 
 @register_canonicalize
@@ -4545,13 +4726,17 @@ class Canonizer(gof.LocalOptimizer):
             numeric constant. If v is a plain Variable, returns None.
 
         """
-        if isinstance(v, Variable):
-            try:
-                # As the constant folding is in the canonicalize phase,
-                # We don't need to check all the graph each time.
-                return get_scalar_constant_value(v, only_process_constants=True)
-            except NotScalarConstantError:
+        if isinstance(v, Constant):
+            if getattr(v.tag, 'unique_value', None) is not None:
+                data = v.tag.unique_value
+            else:
+                data = v.data
+            if data.ndim == 0:
+                return data
+            else:
                 return None
+        elif isinstance(v, Variable):
+            return None
         else:
             return v
 
@@ -4584,10 +4769,25 @@ class Canonizer(gof.LocalOptimizer):
         | [a, b], [c, d] -> [a, b], [c, d]
 
         """
-        for v in list(num):
-            if v in denum:
-                num.remove(v)
-                denum.remove(v)
+        ln = len(num)
+        ld = len(denum)
+        if (ld > 2 and ln > 2):
+            # Faster version for "big" inputs.
+            while True:
+                s = set(num)
+                # Inputs can appear multiple times
+                redo = len(s) != len(num)
+                inter = s.intersection(denum)
+                for v in inter:
+                    num.remove(v)
+                    denum.remove(v)
+                if not redo or not inter:
+                    break
+        else:
+            for v in list(num):
+                if v in denum:
+                    num.remove(v)
+                    denum.remove(v)
         return num, denum
 
     def simplify_constants(self, orig_num, orig_denum, out_type=None):
@@ -4609,9 +4809,8 @@ class Canonizer(gof.LocalOptimizer):
         | [x, 2, y], [z, 2] -> [x, y], [z]
 
         """
-
         # Lists representing the numerator and denumerator
-        num, denum = list(orig_num), list(orig_denum)
+        num, denum = [], []
 
         # Lists representing the *constant* elements of num and denum
         numct, denumct = [], []
@@ -4620,15 +4819,16 @@ class Canonizer(gof.LocalOptimizer):
             ct = self.get_constant(v)
             if ct is not None:
                 # We found a constant in the numerator!
-                # We remove it from num
-                num.remove(v)
                 # We add it to numct
                 numct.append(ct)
+            else:
+                num.append(v)
         for v in orig_denum:
             ct = self.get_constant(v)
             if ct is not None:
-                denum.remove(v)
                 denumct.append(ct)
+            else:
+                denum.append(v)
 
         if self.use_reciprocal or num:
             # This will calculate either:
@@ -4682,6 +4882,13 @@ class Canonizer(gof.LocalOptimizer):
 
         assert len(node.outputs) == 1
         out = node.outputs[0]
+
+        # out won't have a clients field when we didn't commit a
+        # started change in the graph.  We can't do the check if we
+        # want to skip it, so we force the skip it. It should be
+        # reapplied later.
+        if not hasattr(out, 'clients'):
+            return
 
         # check if any of the clients of this node would be part of
         # this canonized graph...  if so, we do nothing and wait for
@@ -4848,6 +5055,7 @@ def local_elemwise_sub_zeros(node):
         return [T.zeros_like(node.inputs[0])]
 
 
+@register_useless
 @register_specialize
 @register_stabilize
 @register_canonicalize
@@ -4883,14 +5091,19 @@ def local_useless_elemwise_comparison(node):
         return
     if node.op.scalar_op.nin != 2:
         return
+
+    # We call zeros_like and one_like with opt=True to generate a
+    # cleaner graph.
+    dtype = node.outputs[0].dtype
+
     # Elemwise[{LT,GT}](X, X) -> Elemwise[zeros](X)
     if isinstance(node.op.scalar_op, (scalar.LT, scalar.GT)) and \
        node.inputs[0] is node.inputs[1]:
-        return [T.zeros_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.zeros_like(node.inputs[0], dtype=dtype, opt=True)]
     # Elemwise[{LE,GE}](X, X) -> Elemwise[ones](X)
     if isinstance(node.op.scalar_op, (scalar.LE, scalar.GE)) and \
        node.inputs[0] is node.inputs[1]:
-        return [T.ones_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.ones_like(node.inputs[0], dtype=dtype, opt=True)]
     # Elemwise[{minimum,maximum}](X, X) -> X
     if isinstance(node.op.scalar_op, (scalar.Minimum, scalar.Maximum)) and \
        node.inputs[0] is node.inputs[1]:
@@ -4901,13 +5114,13 @@ def local_useless_elemwise_comparison(node):
        node.inputs[0].owner and \
        isinstance(node.inputs[0].owner.op, Shape_i) and \
        T.extract_constant(node.inputs[1], only_process_constants=True) == 0:
-        return [T.zeros_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.zeros_like(node.inputs[0], dtype=dtype, opt=True)]
     # Elemwise[GE](X.shape[i], 0) -> Elemwise[ones](X)
     if isinstance(node.op.scalar_op, scalar.GE) and \
        node.inputs[0].owner and \
        isinstance(node.inputs[0].owner.op, Shape_i) and \
        T.extract_constant(node.inputs[1], only_process_constants=True) == 0:
-        return [T.ones_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.ones_like(node.inputs[0], dtype=dtype, opt=True)]
     # Elemwise[maximum](X.shape[i], 0) -> X.shape[i]
     if isinstance(node.op.scalar_op, scalar.Maximum) and \
        node.inputs[0].owner and \
@@ -4925,13 +5138,15 @@ def local_useless_elemwise_comparison(node):
        node.inputs[0].owner and \
        isinstance(node.inputs[0].owner.op, Shape_i) and \
        T.extract_constant(node.inputs[1], only_process_constants=True) == 0:
-        return [T.zeros_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.zeros_like(node.inputs[0], dtype=dtype, opt=True)]
+
+    # It don't detect case when the 0 is all zeros with ndim > 0.
     # Elemwise[minimum](0, X.shape[i]) -> 0
     if isinstance(node.op.scalar_op, scalar.Minimum) and \
        T.extract_constant(node.inputs[0], only_process_constants=True) == 0 and \
        node.inputs[1].owner and \
        isinstance(node.inputs[1].owner.op, Shape_i):
-        return [T.zeros_like(node.inputs[1], dtype=node.outputs[0].dtype)]
+        return [T.zeros_like(node.inputs[1], dtype=dtype, opt=True)]
 
     # Elemwise[LT](add([anything that is shapes]), 0) -> Elemwise[zeros](X)
     if isinstance(node.op.scalar_op, scalar.LT) and \
@@ -4942,7 +5157,7 @@ def local_useless_elemwise_comparison(node):
             for var in node.inputs[0].owner.inputs]) and \
        T.extract_constant(node.inputs[1], only_process_constants=True) == 0:
 
-        return [T.zeros_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.zeros_like(node.inputs[0], dtype=dtype, opt=True)]
     # Elemwise[GE](add([anything that is shapes]), 0) -> Elemwise[ones](X)
     if isinstance(node.op.scalar_op, scalar.GE) and \
        node.inputs[0].owner and \
@@ -4951,7 +5166,7 @@ def local_useless_elemwise_comparison(node):
        all([isinstance(var.owner and var.owner.op, Shape_i)
             for var in node.inputs[0].owner.inputs]) and \
        T.extract_constant(node.inputs[1], only_process_constants=True) == 0:
-        return [T.ones_like(node.inputs[0], dtype=node.outputs[0].dtype)]
+        return [T.ones_like(node.inputs[0], dtype=dtype, opt=True)]
 
     # Elemwise[EQ](Subtensor(Shape(x)), -N)
     # Elemwise[EQ](somegraph that only depend of shape, -N)
@@ -4985,7 +5200,7 @@ def local_useless_elemwise_comparison(node):
                                             only_process_constants=True)
             if cst < 0:
                 return [T.zeros_like(node.inputs[0],
-                                     dtype=node.outputs[0].dtype)]
+                                     dtype=dtype, opt=True)]
         except NotScalarConstantError:
             pass
     return
@@ -5289,9 +5504,10 @@ def local_reduce_join(node):
         return [ret]
 
 
-@register_canonicalize('fast_compile')
+@register_canonicalize('fast_compile', 'local_cut_useless_reduce')
+@register_useless('local_cut_useless_reduce')
 @gof.local_optimizer(ALL_REDUCE)
-def local_cut_useless_reduce(node):
+def local_useless_reduce(node):
     """Sum(a, axis=[]) -> a  """
     if isinstance(node.op, T.CAReduce):
         summed, = node.inputs
@@ -5761,7 +5977,7 @@ def local_add_specialize(node):
 register_specialize(local_add_specialize)
 
 mul_canonizer = in2out(gof.LocalOptGroup(local_mul_canonizer, local_fill_cut,
-                                         local_fill_sink),
+                                         local_fill_sink, apply_all_opts=True),
                        name='mul_canonizer_groups')
 
 
@@ -5851,20 +6067,24 @@ def local_log1p(node):
                 log_arg.owner.inputs, only_process_constants=True)
             # scalar_inputs are potentially dimshuffled and fill'd scalars
             if scalars and numpy.allclose(numpy.sum(scalars), 1):
-                if not nonconsts:
-                    pass  # leave for constant-merge
-                if len(nonconsts) == 1:
-                    return _fill_chain(T.log1p(nonconsts[0]), scalar_inputs)
-                else:
-                    return _fill_chain(T.log1p(T.add(*nonconsts)),
-                                       scalar_inputs)
+                if nonconsts:
+                    if len(nonconsts) > 1:
+                        ninp = T.add(*nonconsts)
+                    else:
+                        ninp = nonconsts[0]
+                    if ninp.dtype != log_arg.type.dtype:
+                        ninp = ninp.astype(node.outputs[0].dtype)
+                    return _fill_chain(T.log1p(ninp), scalar_inputs)
 
         elif log_arg.owner and log_arg.owner.op == T.sub:
             one = T.extract_constant(log_arg.owner.inputs[0],
                                      only_process_constants=True)
             if one != 1:
                 return
-            return [T.log1p(T.neg(log_arg.owner.inputs[1]))]
+            other = log_arg.owner.inputs[1]
+            if other.dtype != log_arg.dtype:
+                other = other.astype(log_arg.dtype)
+            return [T.log1p(T.neg(other))]
 
 
 # TODO: in canonicalize, change log10 and log2 -> log
@@ -5901,6 +6121,49 @@ def local_log_add(node):
                 return [ret]
 
 
+@gof.local_optimizer([T.log])
+def local_log_sum_exp(node):
+    # log(sum_i(exp(x_i))) = x_max + log(sum_i(exp(x_i - x_max)))
+
+    if node.op != T.log:
+        return
+
+    sum_node = node.inputs[0].owner
+    # If the sum has keepdims=True, there might be a dimshuffle
+    if sum_node and isinstance(sum_node.op, T.DimShuffle):
+        dimshuffle_op = sum_node.op
+        sum_node = sum_node.inputs[0].owner
+    else:
+        dimshuffle_op = None
+
+    if not sum_node or not isinstance(sum_node.op, T.Sum):
+        return
+
+    exp_node, axis = sum_node.inputs[0].owner, sum_node.op.axis
+    if not exp_node or not (
+            isinstance(exp_node.op, Elemwise) and
+            isinstance(exp_node.op.scalar_op, scalar.Exp)):
+        return
+
+    pre_exp = exp_node.inputs[0]
+    max_pre_exp = T.max(pre_exp, axis=axis)
+    max_pre_exp_keepdims = T.makeKeepDims(pre_exp, max_pre_exp, axis)
+
+    ret = (max_pre_exp +
+           T.log(T.sum(T.exp(pre_exp - max_pre_exp_keepdims), axis=axis)))
+
+    # Restore the dimshuffle op, if any.
+    if dimshuffle_op:
+        ret = dimshuffle_op(ret)
+
+    return [ret]
+
+
+compile.optdb.register('local_log_sum_exp',
+                       in2out(local_log_sum_exp, ignore_newtrees=True),
+                       1.6, 'fast_run')
+
+
 def add_calculate(num, denum, aslist=False, out_type=None):
     # TODO: make sure that this function and mul_calculate are similar
     if out_type is None:
@@ -5920,7 +6183,7 @@ def add_calculate(num, denum, aslist=False, out_type=None):
 
 local_add_canonizer = Canonizer(T.add, T.sub, T.neg, add_calculate)
 add_canonizer = in2out(gof.LocalOptGroup(local_add_canonizer, local_fill_cut,
-                                         local_fill_sink),
+                                         local_fill_sink, apply_all_opts=True),
                        name='add_canonizer_group')
 
 
@@ -6083,20 +6346,12 @@ def constant_folding(node):
     for o in node.outputs:
         storage_map[o] = [None]
         compute_map[o] = [False]
+    impl = None
     if (hasattr(node.op, 'python_constant_folding') and
             node.op.python_constant_folding(node)):
-        old_value = getattr(node.op, '_op_use_c_code', False)
-        try:
-            node.op._op_use_c_code = False
-            thunk = node.op.make_thunk(node,
-                                       storage_map,
-                                       compute_map,
-                                       [])
-        finally:
-            node.op._op_use_c_code = old_value
-    else:
-        thunk = node.op.make_thunk(node, storage_map, compute_map,
-                                   no_recycling=[])
+        impl = 'py'
+    thunk = node.op.make_thunk(node, storage_map, compute_map,
+                               no_recycling=[], impl=impl)
 
     required = thunk()
     assert not required  # a node whose inputs are all provided should always
@@ -6984,7 +7239,7 @@ def local_add_mul_fusion(node):
     """Fuse consecutive add or mul in one such node with more inputs.
 
     It is better to fuse add/mul that way then in a Composite node as
-    this make the inner graph of the Compiste smaller. This allow to
+    this make the inner graph of the Composite smaller. This allow to
     put more computation in a Composite before hitting the max
     recusion limit when pickling Composite.
 
@@ -6994,16 +7249,32 @@ def local_add_mul_fusion(node):
         return False
 
     s_op = node.op.scalar_op.__class__
+    new_inp = []
+    fused = False
     for inp in node.inputs:
         if (inp.owner and
                 isinstance(inp.owner.op, Elemwise) and
-                isinstance(inp.owner.op.scalar_op, s_op)):
-            l = list(node.inputs)
-            l.remove(inp)
-            output_node = node.op(*(l + inp.owner.inputs))
+                isinstance(inp.owner.op.scalar_op, s_op) and
+                # Do not duplicate the operation.
+                len(inp.clients) == 1):
+            new_inp.extend(inp.owner.inputs)
+            fused = True
+        else:
+            new_inp.append(inp)
 
-            copy_stack_trace(node.outputs[0], output_node)
-            return [output_node]
+    # We ca not compare the number of inputs as Mul and Add could have
+    # 0 or 1 inputs in some corner cases.
+    if fused:
+        output = node.op(*new_inp)
+        copy_stack_trace(node.outputs[0], output)
+
+        # Do the recursion here to help lower the number of
+        # FusionOptimizer iteration.
+        if output.owner:
+            output2 = local_add_mul_fusion(output.owner)
+            if output2:
+                return output2
+        return [output]
 
 if config.tensor.local_elemwise_fusion:
     _logger.debug("enabling optimization fusion elemwise in fast_run")
@@ -7053,6 +7324,7 @@ def local_grad_clip(node):
         return node.inputs
 
 
+@register_useless
 @register_canonicalize
 @register_stabilize
 @register_specialize
